@@ -1,0 +1,31 @@
+# /config/packages/remote_voice.yaml
+# Needs, in configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# One input_boolean per remote. The app reads it the moment you press the mic key:
+#   on  -> Siri on that room's Apple TV (appletv_siri, ?route=siri)
+#   off -> your default Assist pipeline
+# The automation keeps it in sync with the room's Harmonium activity; you can still flip it by hand.
+# Copy both blocks per room, and replace the activity names with your real Apple TV activities.
+
+input_boolean:
+  remote_siri_great_room:
+    name: Great Room remote → Siri
+    icon: mdi:apple
+
+automation:
+  - id: remote_siri_great_room_follow_activity
+    alias: "Remote voice: Great Room follows Apple TV activity"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: select.harmonium_great_room_activity
+        not_to: ["unavailable", "unknown"]
+    actions:
+      - action: >-
+          {{ 'input_boolean.turn_on'
+             if trigger.to_state.state in ['Watch Apple TV']
+             else 'input_boolean.turn_off' }}
+        target:
+          entity_id: input_boolean.remote_siri_great_room
