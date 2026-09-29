@@ -19,7 +19,12 @@ import android.view.WindowManager
  * Any key, touch, screen-on, proximity or unplug counts as a press ([interaction]).
  * Timers are single postDelayed calls; nothing polls.
  */
-class ScreenKeeper(private val window: Window, private val prefs: HostPrefs) {
+class ScreenKeeper(
+    private val window: Window,
+    private val prefs: HostPrefs,
+    /** Told when the dim state changes (the screensaver can follow it). */
+    private val onDimChanged: (Boolean) -> Unit = {},
+) {
 
     private val handler = Handler(Looper.getMainLooper())
     private val tick = Runnable { evaluate() }
@@ -57,6 +62,9 @@ class ScreenKeeper(private val window: Window, private val prefs: HostPrefs) {
         if (next != Long.MAX_VALUE) handler.postDelayed(tick, next)
     }
 
+    /** Dim right away (used for "screen off" without device-admin rights). The next press undims. */
+    fun dimNow() = setDimmed(true)
+
     fun release() {
         handler.removeCallbacks(tick)
         setHolding(false)
@@ -78,6 +86,7 @@ class ScreenKeeper(private val window: Window, private val prefs: HostPrefs) {
         lp.screenBrightness = if (on) (prefs.dimLevelPct.coerceIn(0, 100) / 100f).coerceAtLeast(0.01f)
                               else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         window.attributes = lp
+        onDimChanged(on)
     }
 
     private companion object { const val TAG = "HarmoniumHost" }

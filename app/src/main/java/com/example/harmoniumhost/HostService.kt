@@ -12,6 +12,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.IBinder
@@ -22,6 +24,7 @@ import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 
 /**
  * Always-running companion to MainActivity:
@@ -29,10 +32,11 @@ import java.util.Locale
  *  - on the cradle: wake briefly so the charging screen is seen
  *  - off the cradle: wake immediately (you're about to use it)
  *  - proximity (the device's only wake-up sensor): wake when a hand comes near
- *  - the ESPHome API server, so HA sees the remote as a voice satellite with battery entities
+ *  - ambient light, read only while the screen is on
+ *  - the ESPHome API server: voice satellite, controls and diagnostics for Home Assistant
  *  - while the screen is on: Wi-Fi out of power save
  */
-class HostService : Service(), SensorEventListener {
+class HostService : Service() {
 
     companion object {
         /** Sent by Settings after a save. */
@@ -41,6 +45,7 @@ class HostService : Service(), SensorEventListener {
         private const val TAG = "HarmoniumHost"
         private const val CHANNEL = "host"
         private const val PROXIMITY_WAKE_GAP_MS = 3_000L
+        private const val LUX_REPORT_GAP_MS = 5_000L
 
         fun reload(context: Context, espChanged: Boolean = false) = ContextCompat.startForegroundService(
             context, Intent(context, HostService::class.java).setAction(ACTION_RELOAD)
@@ -50,9 +55,11 @@ class HostService : Service(), SensorEventListener {
     private lateinit var app: HostApp
     private lateinit var power: PowerManager
     private lateinit var sensors: SensorManager
+    private lateinit var device: RemoteDevice
     private var wifiLock: WifiManager.WifiLock? = null
     private var proximity: Sensor? = null
     private var lastProximityWake = 0L
+    private var lastLuxReport = 0L
     private val clock = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     // Must be registered at runtime: manifest receivers don't get these since Android 8.0.
@@ -74,12 +81,48 @@ class HostService : Service(), SensorEventListener {
                     val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
                     val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
                     HostState.setBattery(pct, plugged, plugged && status == BatteryManager.BATTERY_STATUS_FULL)
-                    app.esp.publishBattery(pct, plugged)
+                    app.esp.refresh()        // queued on the ESPHome writer thread, never the main thread
                 }
                 Intent.ACTION_SCREEN_ON -> screen(true)
                 Intent.ACTION_SCREEN_OFF -> screen(false)
             }
         }
+    }
+
+    private val proximityListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val near = e.values[0] < (proximity?.maximumRange ?: 5f)
+            val interactive = power.isInteractive
+            Log.i(TAG, "proximity ${if (near) "NEAR" else "FAR"} (${e.values[0]}) screen=${if (interactive) "on" else "off"}")
+            HostState.proximity(near, clock.format(Date()))
+            val now = SystemClock.elapsedRealtime()
+            if (!interactive && now - lastProximityWake > PROXIMITY_WAKE_GAP_MS) {
+                lastProximityWake = now
+                Log.i(TAG, "proximity wake")
+                wakeScreen(1_000)
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    /** Non-wake-up, so registered only while the screen is on. Reports at most every 5 s, on real changes. */
+    private val lightListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val lux = e.values[0]
+            val prev = HostState.lux
+            HostState.lux = lux
+            val now = SystemClock.elapsedRealtime()
+            val big = prev == null || abs(lux - prev) > maxOf(5f, prev * 0.1f)
+            if (big && now - lastLuxReport > LUX_REPORT_GAP_MS) {
+                lastLuxReport = now
+                app.esp.refresh()
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private val network = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(n: Network) { device.networkUpSince = SystemClock.elapsedRealtime() }
     }
 
     override fun onCreate() {
@@ -90,7 +133,13 @@ class HostService : Service(), SensorEventListener {
         startForeground(1, notification())
 
         Log.i(TAG, "Harmonium Host ${app.versionName} service starting")
+        device = RemoteDevice(this, app.esp)
+        app.device = device
+        app.esp.entities = device.entities
+        app.esp.haSubscriptions = { device.haSubscriptions() }
+        app.esp.onHaState = { id, attr, state -> device.onHaState(id, attr, state) }
         app.esp.start()
+
         val sticky = ContextCompat.registerReceiver(this, events, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_POWER_DISCONNECTED)
@@ -100,6 +149,7 @@ class HostService : Service(), SensorEventListener {
         }, ContextCompat.RECEIVER_NOT_EXPORTED)
         // BATTERY_CHANGED is sticky: the current state comes back from registerReceiver.
         sticky?.let { events.onReceive(this, it) }
+        (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(network)
 
         // High-perf only while the screen is on (keys land fast); normal power save while it's off.
         @Suppress("DEPRECATION")
@@ -115,6 +165,7 @@ class HostService : Service(), SensorEventListener {
         if (intent?.action == ACTION_RELOAD) {
             applySettings()
             if (intent.getBooleanExtra(EXTRA_ESP_CHANGED, false)) app.esp.reload()
+            app.esp.refresh()
         }
         return START_STICKY
     }
@@ -123,7 +174,11 @@ class HostService : Service(), SensorEventListener {
 
     override fun onDestroy() {
         unregisterReceiver(events)
-        sensors.unregisterListener(this)
+        sensors.unregisterListener(proximityListener)
+        sensors.unregisterListener(lightListener)
+        try {
+            (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(network)
+        } catch (e: Exception) {}
         wifiLock?.release()
         app.esp.stop()
         super.onDestroy()
@@ -133,10 +188,15 @@ class HostService : Service(), SensorEventListener {
         Log.i(TAG, "screen ${if (on) "on" else "off"}")
         if (on) {
             wifiLock?.acquire()
+            sensors.getDefaultSensor(Sensor.TYPE_LIGHT)?.let {
+                sensors.registerListener(lightListener, it, SensorManager.SENSOR_DELAY_NORMAL)
+            }
             HostState.fire(HostState.Event.SCREEN_ON)
         } else {
             wifiLock?.release()
+            sensors.unregisterListener(lightListener)
         }
+        app.esp.refresh()
     }
 
     // ---------- proximity ----------
@@ -151,31 +211,15 @@ class HostService : Service(), SensorEventListener {
             if (p == null) {
                 Log.w(TAG, "no proximity sensor")
             } else {
-                sensors.registerListener(this, p, SensorManager.SENSOR_DELAY_NORMAL)
+                sensors.registerListener(proximityListener, p, SensorManager.SENSOR_DELAY_NORMAL)
                 Log.i(TAG, "proximity wake on: ${p.name}, wakeUp=${p.isWakeUpSensor}, range=${p.maximumRange}")
             }
         } else if (!want && proximity != null) {
-            sensors.unregisterListener(this)
+            sensors.unregisterListener(proximityListener)
             proximity = null
             Log.i(TAG, "proximity wake off")
         }
     }
-
-    override fun onSensorChanged(e: SensorEvent) {
-        val near = e.values[0] < (proximity?.maximumRange ?: 5f)
-        val at = clock.format(Date())
-        val interactive = power.isInteractive
-        Log.i(TAG, "proximity ${if (near) "NEAR" else "FAR"} (${e.values[0]}) screen=${if (interactive) "on" else "off"}")
-        HostState.proximity(near, at)
-        val now = SystemClock.elapsedRealtime()
-        if (!interactive && now - lastProximityWake > PROXIMITY_WAKE_GAP_MS) {
-            lastProximityWake = now
-            Log.i(TAG, "proximity wake")
-            wakeScreen(1_000)
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
     // ---------- helpers ----------
 

@@ -10,6 +10,8 @@ class HostApp : Application() {
     val prefs by lazy { HostPrefs(this) }
     val http: OkHttpClient by lazy { OkHttpClient.Builder().readTimeout(30, TimeUnit.SECONDS).build() }
     val esp by lazy { EspServer(this, prefs) }
+    /** Created by HostService. */
+    @Volatile var device: RemoteDevice? = null
 
     private val pkg by lazy { packageManager.getPackageInfo(packageName, 0) }
     val versionName: String get() = pkg.versionName ?: "?"
