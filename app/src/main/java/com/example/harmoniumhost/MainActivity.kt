@@ -5,17 +5,19 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.webkit.RenderProcessGoneDetail
@@ -30,6 +32,9 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 /**
@@ -40,8 +45,12 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         const val TAG = "HarmoniumHost"
-        /** Hold the battery readout at the top this long to open Settings. */
-        private const val SETTINGS_HOLD_MS = 3_000L
+        /** A swipe that starts this close to the top edge… */
+        private const val SWIPE_EDGE_DP = 36
+        /** …and travels this far down opens Settings. */
+        private const val SWIPE_DISTANCE_DP = 90
+        /** Last-interaction is reported to HA at most this often. */
+        private const val INTERACTION_REPORT_MS = 10_000L
 
         private const val NO_SIDEWAYS_SCROLL = """(function(){
             if (document.getElementById('hh-noside')) return;
@@ -71,36 +80,51 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusLine: TextView
     private lateinit var voiceOverlay: TextView
     private lateinit var charging: ChargingScreen
+    private lateinit var screensaver: Screensaver
     private lateinit var voice: VoiceSatellite
     private lateinit var keeper: ScreenKeeper
     private val remap = KeyRemap { window.superDispatchKeyEvent(it) }
     private val hideVoiceOverlay = Runnable { voiceOverlay.visibility = View.GONE }
-    private val openSettings = Runnable { startActivity(Intent(this, SettingsActivity::class.java)) }
-    private var pressX = 0f
-    private var pressY = 0f
+    private var swallowGesture = false
+    private var swipeFromTop = false
+    private var swipeX = 0f
+    private var swipeY = 0f
+    private var lastInteractionReport = 0L
 
     private val hostListener = object : HostState.Listener {
         override fun onHostState() {
             updateStatusLine()
             keeper.evaluate()
+            if (screensaver.showing) screensaver.updateWeather()
         }
         override fun onHostEvent(event: HostState.Event) {
             when (event) {
                 HostState.Event.SCREEN_ON -> {
-                    keeper.interaction()
+                    interaction()
                     goImmersive()
                 }
                 // A hand coming near brightens a dimmed screen before the thumb lands.
-                HostState.Event.PROXIMITY -> keeper.interaction()
+                HostState.Event.PROXIMITY -> interaction()
                 HostState.Event.PLUGGED -> {
-                    keeper.interaction()
+                    interaction()
                     val secs = prefs.chargeScreenSec
                     if (secs > 0) charging.show(HostState.batteryLevel, HostState.batteryFull, secs * 1000L)
                 }
                 HostState.Event.UNPLUGGED -> {
                     charging.dismiss()
-                    keeper.interaction()
+                    interaction()
                     goImmersive()
+                }
+                HostState.Event.RELOAD -> loadHarmonium()
+                HostState.Event.CLEAR_CACHE -> {
+                    webView.clearCache(true)
+                    loadHarmonium()
+                }
+                HostState.Event.SCREENSAVER_ON -> screensaver.show(prefs.screensaverMode)
+                HostState.Event.SCREENSAVER_OFF -> screensaver.hide()
+                HostState.Event.SCREEN_BLACK -> {
+                    screensaver.show("black")
+                    keeper.dimNow()
                 }
             }
         }
@@ -115,7 +139,9 @@ class MainActivity : AppCompatActivity() {
         prefs.absorbProvisioning(intent)
         setShowWhenLocked(true)
         goImmersive()
-        keeper = ScreenKeeper(window, prefs)
+        keeper = ScreenKeeper(window, prefs) { dimmed ->
+            if (dimmed && prefs.screensaverWhenDimmed) screensaver.show(prefs.screensaverMode)
+        }
 
         val dp = resources.displayMetrics.density
         webView = VerticalWebView(this)
@@ -136,10 +162,12 @@ class MainActivity : AppCompatActivity() {
             isFocusable = false   // clickable views are focusable on API 26+; keys must stay on the WebView
         }
         charging = ChargingScreen(this)
+        screensaver = Screensaver(this)
         root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(statusLine, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+            addView(screensaver, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(voiceOverlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(charging, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         }
@@ -162,7 +190,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 // Only vertical scrolling: stop the page from panning sideways under a swipe.
                 view.evaluateJavascript(NO_SIDEWAYS_SCROLL, null)
+                pageChanged(url)
             }
+            override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) = pageChanged(url)
             // The MT6580 is short on memory; if the renderer is killed, start over instead of crashing.
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                 Log.w(TAG, "WebView renderer gone (crash=${detail.didCrash()}); recreating")
@@ -176,6 +206,7 @@ class MainActivity : AppCompatActivity() {
         voice = VoiceSatellite(this, prefs, app.esp) { text, done ->
             runOnUiThread { showVoiceOverlay(text, if (done) 2500L else 0L) }
         }
+        HostState.screenshot = { screenshot() }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
@@ -187,7 +218,7 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.startForegroundService(this, Intent(this, HostService::class.java))
         applySettings()
 
-        if (!prefs.setupDone) root.post(openSettings)
+        if (!prefs.setupDone) root.post { openSettings() }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -200,6 +231,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        HostState.appInForeground = true
         goImmersive()
         readBattery()
         applySettings()
@@ -207,7 +239,12 @@ class MainActivity : AppCompatActivity() {
             prefs.reloadPending = false
             loadHarmonium()
         }
-        keeper.interaction()
+        interaction()
+    }
+
+    override fun onPause() {
+        HostState.appInForeground = false
+        super.onPause()
     }
 
     // Deliberately NOT calling webView.onPause()/pauseTimers() in onPause: keeping the page
@@ -215,6 +252,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         HostState.removeListener(hostListener)
+        HostState.screenshot = null
         keeper.release()
         webView.destroy()
         super.onDestroy()
@@ -238,6 +276,20 @@ class MainActivity : AppCompatActivity() {
         keeper.evaluate()
     }
 
+    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+
+    /** A press, touch, wake or approaching hand: brighten, restart the idle timers, drop the screensaver. */
+    private fun interaction() {
+        keeper.interaction()
+        screensaver.hide()
+        HostState.lastInteractionAt = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastInteractionReport > INTERACTION_REPORT_MS) {
+            lastInteractionReport = now
+            app.esp.refresh()
+        }
+    }
+
     // ---------- input ----------
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -246,7 +298,7 @@ class MainActivity : AppCompatActivity() {
                 "scan=${event.scanCode} ${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}")
         }
         if (event.action == KeyEvent.ACTION_DOWN) {
-            keeper.interaction()
+            interaction()                               // the key still goes on to Harmonium below
             charging.dismiss()
             if (!webView.hasFocus()) webView.requestFocus()
         }
@@ -270,33 +322,40 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) keeper.interaction()
-        watchSettingsGesture(ev)
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            swallowGesture = screensaver.showing       // a tap on the screensaver only wakes it up
+            interaction()
+        }
+        if (swallowGesture) {
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                swallowGesture = false
+            }
+            return true
+        }
+        watchSwipeDown(ev)
         return super.dispatchTouchEvent(ev)
     }
 
-    /** Long-press on the battery readout opens Settings. Watches only; never takes the touch from Harmonium. */
-    private fun watchSettingsGesture(ev: MotionEvent) {
-        when (ev.actionMasked) {
-            MotionEvent.ACTION_DOWN -> if (inSettingsZone(ev.x, ev.y)) {
-                pressX = ev.x
-                pressY = ev.y
-                root.postDelayed(openSettings, SETTINGS_HOLD_MS)
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val slop = ViewConfiguration.get(this).scaledTouchSlop
-                if (abs(ev.x - pressX) > slop || abs(ev.y - pressY) > slop) root.removeCallbacks(openSettings)
-            }
-            else -> root.removeCallbacks(openSettings)
-        }
-    }
-
-    private fun inSettingsZone(x: Float, y: Float): Boolean {
+    /** Swipe down from the top edge opens Settings (like Android's own pull-down). Watches only. */
+    private fun watchSwipeDown(ev: MotionEvent) {
         val dp = resources.displayMetrics.density
-        if (y > 40 * dp) return false
-        val cx = if (statusLine.visibility == View.VISIBLE && statusLine.width > 0)
-            statusLine.left + statusLine.width / 2f else root.width / 2f
-        return abs(x - cx) < 40 * dp
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                swipeFromTop = ev.y < SWIPE_EDGE_DP * dp
+                swipeX = ev.x
+                swipeY = ev.y
+            }
+            MotionEvent.ACTION_MOVE -> if (swipeFromTop) {
+                val dy = ev.y - swipeY
+                val dx = abs(ev.x - swipeX)
+                if (dx > dy) swipeFromTop = dx < 24 * dp           // sideways: not our gesture
+                else if (dy > SWIPE_DISTANCE_DP * dp) {
+                    swipeFromTop = false
+                    openSettings()
+                }
+            }
+            else -> swipeFromTop = false
+        }
     }
 
     // ---------- Harmonium ----------
@@ -322,6 +381,15 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(url)
     }
 
+    private fun pageChanged(url: String) {
+        // never report the provisioning fragment (it can carry the token)
+        val clean = url.substringBefore("#token=").substringBefore("&token=")
+        if (clean != HostState.pageUrl) {
+            HostState.pageUrl = clean
+            app.esp.refresh()
+        }
+    }
+
     /** Reads the sticky battery state directly, so the readout shows even before the service reports. */
     private fun readBattery() {
         val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
@@ -330,6 +398,28 @@ class MainActivity : AppCompatActivity() {
         val plugged = b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
         val full = plugged && b.getIntExtra(BatteryManager.EXTRA_STATUS, -1) == BatteryManager.BATTERY_STATUS_FULL
         if (level >= 0 && scale > 0) HostState.setBattery(level * 100 / scale, plugged, full)
+    }
+
+    /** JPEG of what's on screen, for HA's screenshot camera. Called off the main thread. */
+    private fun screenshot(): ByteArray? {
+        var out: ByteArray? = null
+        val done = CountDownLatch(1)
+        runOnUiThread {
+            try {
+                if (root.width > 0 && root.height > 0) {
+                    val bmp = Bitmap.createBitmap(root.width, root.height, Bitmap.Config.RGB_565)
+                    root.draw(Canvas(bmp))
+                    out = ByteArrayOutputStream().also { bmp.compress(Bitmap.CompressFormat.JPEG, 70, it) }.toByteArray()
+                    bmp.recycle()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "screenshot failed", e)
+            } finally {
+                done.countDown()
+            }
+        }
+        done.await(3, TimeUnit.SECONDS)
+        return out
     }
 
     // ---------- overlays ----------

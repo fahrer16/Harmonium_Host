@@ -20,6 +20,7 @@ class HostPrefs(context: Context) {
         const val KEEP_NEVER = "never"
         const val KEEP_ACTIVITY = "activity"
         const val KEEP_ALWAYS = "always"
+        val SCREENSAVER_MODES = listOf("black", "clock", "weather")
 
         /**
          * What Key Mapper's "FullyKiosk" group emits today (harmonium repo,
@@ -43,7 +44,7 @@ class HostPrefs(context: Context) {
 
         private val ADB_KEYS = listOf(
             "ha_url", "token", "room", "harmonium_path", "harmonium_profile", "start_page",
-            "activity_entity", "esp_name", "esp_friendly_name",
+            "activity_entity", "esp_name", "esp_friendly_name", "weather_entity",
         )
     }
 
@@ -114,6 +115,13 @@ class HostPrefs(context: Context) {
     /** On the cradle, battery isn't a concern: ignore [awakeLimitMin] there. */
     val cradleNoLimit get() = bool("cradle_no_limit", true)
     val proximityWake get() = bool("proximity_wake", true)
+
+    // ---- Screensaver ----
+    val screensaverMode get() = str("screensaver_mode", "clock").takeIf { it in SCREENSAVER_MODES } ?: "clock"
+    /** Show the screensaver when the screen dims (instead of just dimming Harmonium). */
+    val screensaverWhenDimmed get() = bool("screensaver_when_dimmed", false)
+    /** HA weather entity for the weather screensaver, e.g. weather.home. */
+    val weatherEntity get() = str("weather_entity")
 
     // ---- Charging and status line ----
     val chargeScreenSec get() = int("charge_screen_s", 4)

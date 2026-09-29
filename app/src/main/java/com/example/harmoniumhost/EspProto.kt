@@ -54,6 +54,7 @@ class ProtoWriter {
 /** Decodes one message into per-field values. Unknown fields are kept, never an error. */
 class ProtoReader(bytes: ByteArray) {
     private val varints = HashMap<Int, Long>()
+    private val fixed = HashMap<Int, Int>()
     private val blobs = HashMap<Int, MutableList<ByteArray>>()
 
     init {
@@ -81,7 +82,12 @@ class ProtoReader(bytes: ByteArray) {
                     blobs.getOrPut(field) { ArrayList() } += bytes.copyOfRange(i, i + len)
                     i += len
                 }
-                5 -> i += 4
+                5 -> {
+                    if (i + 4 > bytes.size) break
+                    fixed[field] = (bytes[i].toInt() and 0xFF) or ((bytes[i + 1].toInt() and 0xFF) shl 8) or
+                        ((bytes[i + 2].toInt() and 0xFF) shl 16) or ((bytes[i + 3].toInt() and 0xFF) shl 24)
+                    i += 4
+                }
                 else -> break    // groups aren't used by the API
             }
         }
@@ -89,6 +95,8 @@ class ProtoReader(bytes: ByteArray) {
 
     fun uint(field: Int) = varints[field] ?: 0L
     fun bool(field: Int) = uint(field) != 0L
+    fun fixed32(field: Int) = fixed[field] ?: 0
+    fun float(field: Int) = java.lang.Float.intBitsToFloat(fixed32(field))
     fun string(field: Int) = blobs[field]?.firstOrNull()?.toString(Charsets.UTF_8) ?: ""
     fun messages(field: Int): List<ProtoReader> = blobs[field]?.map { ProtoReader(it) } ?: emptyList()
 }

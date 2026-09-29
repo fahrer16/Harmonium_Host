@@ -12,7 +12,9 @@ and adds what a kiosk browser can't do:
 - **Charging feedback.** A charging screen after the remote lands on the cradle, and a small
   battery readout at the top. Battery and charging are also HA entities.
 - **Key translation** that replaces Key Mapper (Back, volume, mute, menu, long presses).
-- **All settings on the remote**, in a settings screen. Nothing is compiled in.
+- **Home Assistant controls and diagnostics**, like a kiosk app: screen on/off, screensaver,
+  brightness, volume, reload, clear cache, restart, a screenshot camera, and device diagnostics.
+- **All settings on the remote**, in a settings screen styled like Harmonium. Nothing is compiled in.
 
 ## Install
 
@@ -22,13 +24,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.example.harmoniumhost/.MainActivity
 ```
 
-Check you're running this build: the settings title shows the version (0.2), and
-`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.2 starting`.
+Check you're running this build: the settings title shows the version (0.3), and
+`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.3 starting`.
 
 ## Settings
 
 Open settings in any of these ways:
-- Hold the top centre edge of the screen (where the battery % shows) for 3 seconds.
+- **Swipe down from the top edge of the screen** (like Android's own pull-down).
 - Open **Harmonium settings** from the Android app drawer.
 - `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`
 
@@ -59,9 +61,30 @@ The remote runs the ESPHome native API on port 6053 and announces itself on the 
    *Settings → Voice assistants*.
 3. Hold the mic button, speak, release.
 
-The device also has **Battery** and **Charging** entities. HA's "Finished speaking detection"
-setting on the device decides how long a pause ends the sentence. Releasing the button always
-ends it.
+HA's "Finished speaking detection" setting on the device decides how long a pause ends the
+sentence. Releasing the button always ends it.
+
+## What the device offers Home Assistant
+
+| Kind | Entities |
+|---|---|
+| Controls | Screen (switch), Screensaver (switch), Screensaver mode (black / clock / weather), Adaptive brightness (switch), Screen brightness (%), Volume (%) |
+| Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot |
+| Camera | Screenshot (a fresh one each time HA asks, or after "Take screenshot") |
+| Sensors | Battery, Charging, Ambient light (lux, only while the screen is on), Last interaction, Activity running |
+| Diagnostics | Android version, App version, App uptime, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Last seen, Network uptime, RAM available/total, Wi-Fi signal |
+
+Some controls need a one-time permission, granted from the remote's Settings → Permissions:
+- **Screen off**: device admin ("force lock"). Without it, turning the screen off shows a black
+  screensaver at minimum brightness instead.
+- **Modify system settings**: brightness, adaptive brightness and Android's screen timeout.
+- **Usage access**: the Foreground app diagnostic. Without it, it only says whether it's this app.
+
+CPU usage is the whole device when Android allows reading it; Android 8 usually doesn't, and it
+then reports this app's share. Diagnostics refresh every minute; controls report back right away.
+
+The weather screensaver reads an HA weather entity (e.g. `weather.home`) set in the remote's
+settings; HA forwards its condition and temperature over the ESPHome connection.
 
 ## Battery
 

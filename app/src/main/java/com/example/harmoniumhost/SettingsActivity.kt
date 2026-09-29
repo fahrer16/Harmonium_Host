@@ -2,6 +2,9 @@ package com.example.harmoniumhost
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.AppOpsManager
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -9,13 +12,16 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.Process
 import android.provider.Settings
 import android.text.InputType
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
-import android.view.WindowManager
+import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -27,22 +33,27 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
+import com.example.harmoniumhost.HarmoniumStyle as S
 
 /**
  * Every setting the remote needs, saved on the remote (SharedPreferences via [HostPrefs]).
- * Open it by holding the battery readout at the top of the screen for 3 s, from the launcher
- * ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
- * Plain views built in code: nothing to inflate, and fields are one line each.
+ * Open it by swiping down from the top edge of the screen, from the launcher ("Harmonium
+ * settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
+ * Styled like Harmonium (see [HarmoniumStyle]); every control is D-pad reachable and shows the
+ * amber focus ring. Plain views built in code: nothing to inflate, and fields are one line each.
  */
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var app: HostApp
     private lateinit var prefs: HostPrefs
-    private lateinit var list: LinearLayout
+    private lateinit var page: LinearLayout
+    /** The card currently being filled. */
+    private lateinit var card: LinearLayout
     private val savers = ArrayList<(SharedPreferences.Editor) -> Unit>()
 
     private lateinit var urlField: EditText
@@ -52,33 +63,38 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var timeoutField: EditText
     private lateinit var micLabel: TextView
     private lateinit var statusText: TextView
+    private lateinit var permissionsText: TextView
     private var micCode = 0
     private var micScan = -1
     private var learningMic = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_YES     // dialogs match the dark page
         super.onCreate(savedInstanceState)
         app = HostApp.of(this)
         prefs = app.prefs
         micCode = prefs.micKeyCode
         micScan = prefs.micScanCode
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // don't sleep mid-typing
-        val pad = dp(16)
-        list = LinearLayout(this).apply {
+        window.statusBarColor = S.BG
+        window.navigationBarColor = S.BG
+        page = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad * 3)
+            setPadding(dp(12), dp(12), dp(12), dp(24))
         }
-        setContentView(ScrollView(this).apply { addView(list, MATCH_PARENT, WRAP_CONTENT) })
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(S.BG)
+            isFillViewport = true
+            addView(page, MATCH_PARENT, WRAP_CONTENT)
+        })
 
-        heading("Harmonium Host ${app.versionName}", 22f)
-        buttons("Save" to ::save, "Test connection" to ::test, "Close" to ::finish)
-        buttons("Android settings" to { startActivity(Intent(Settings.ACTION_SETTINGS)) },
-            "Wi-Fi" to { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) })
+        title()
+        buttons(Triple("Save", true, ::save), Triple("Test", false, ::test), Triple("Close", false, ::finish))
 
-        heading("Status")
-        statusText = label("")
+        section("Status")
+        statusText = body("")
 
-        heading("Harmonium")
+        section("Harmonium")
         urlField = text("ha_url", "Home Assistant URL (use the IP address)", prefs.haUrl,
             InputType.TYPE_TEXT_VARIATION_URI)
         pathField = text("harmonium_path", "Harmonium page path", prefs.harmoniumPath)
@@ -97,23 +113,22 @@ class SettingsActivity : AppCompatActivity() {
             if (prefs.token.isEmpty()) "not set: Harmonium's own pairing is fine" else "saved (type here to replace)",
             "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
 
-        heading("Voice assistant (Home Assistant device)")
+        section("Voice assistant and Home Assistant device")
         note("This remote is an ESPHome device. In Home Assistant: Settings → Devices & services. " +
             "Accept the discovered \"${prefs.espFriendlyName}\", or Add integration → ESPHome → " +
             "host ${ipAddress() ?: "<this remote's IP>"}, port ${EspServer.PORT}. Then open the device " +
             "to set its area and its Assistant (pipeline). Hold the mic button and speak.")
-        text("esp_name", "Device name (a-z, 0-9, -)", prefs.rawString("esp_name") ?: "",
-            hint = prefs.espName)
+        text("esp_name", "Device name (a-z, 0-9, -)", prefs.rawString("esp_name") ?: "", hint = prefs.espName)
         text("esp_friendly_name", "Friendly name", prefs.rawString("esp_friendly_name") ?: "",
             hint = prefs.espFriendlyName)
-        micLabel = label("")
+        micLabel = body("")
         showMic()
-        buttons("Learn mic button" to {
+        buttons(Triple("Learn mic button", false) {
             learningMic = true
             micLabel.text = "Press the mic button now…"
         })
 
-        heading("Screen and wake")
+        section("Screen and wake")
         choice("keep_awake", "Keep the screen on (dimmed) so the first press always works",
             listOf(HostPrefs.KEEP_ACTIVITY to "While an activity is running",
                 HostPrefs.KEEP_ALWAYS to "Always",
@@ -128,14 +143,22 @@ class SettingsActivity : AppCompatActivity() {
         timeoutField = field("Android screen timeout (seconds; applies when not kept on)", "",
             systemTimeoutSec()?.toString() ?: "", InputType.TYPE_CLASS_NUMBER)
 
-        heading("Charging and battery")
+        section("Screensaver")
+        choice("screensaver_mode", "Style", HostPrefs.SCREENSAVER_MODES.map { it to it.replaceFirstChar { c -> c.uppercase() } },
+            prefs.screensaverMode)
+        toggle("screensaver_when_dimmed", "Show it when the screen dims", prefs.screensaverWhenDimmed)
+        text("weather_entity", "Weather entity (for the weather style)", prefs.rawString("weather_entity") ?: "",
+            hint = "weather.home")
+        note("Home Assistant can also turn the screensaver on and off (the Screensaver switch on the device).")
+
+        section("Charging and battery")
         number("charge_screen_s", "Charging screen (seconds, 0 = off)", prefs.chargeScreenSec)
         toggle("status_show", "Battery % at the top of the screen", prefs.statusShow)
         choice("status_pos", "Position", listOf("center" to "Top centre", "left" to "Top left",
             "right" to "Top right (overlaps Harmonium's ⓘ)"), prefs.statusPos)
         number("status_size_sp", "Text size (sp)", prefs.statusSizeSp)
 
-        heading("Keys")
+        section("Keys")
         note("One rule per line: key, short press, optional long press. Key names are Android " +
             "KeyEvent names without KEYCODE_. Keys not listed pass through unchanged. " +
             "Defaults match the Key Mapper setup Harmonium documents for the Astrion.")
@@ -146,29 +169,46 @@ class SettingsActivity : AppCompatActivity() {
             textSize = 12f
             setHorizontallyScrolling(true)
             minLines = 6
+            gravity = Gravity.TOP or Gravity.START
         }
         savers += { it.putString("key_rules", rulesField.text.toString()) }
-        buttons("Restore default keys" to { rulesField.setText(HostPrefs.DEFAULT_KEY_RULES) })
+        buttons(Triple("Restore default keys", false) { rulesField.setText(HostPrefs.DEFAULT_KEY_RULES) })
         number("long_press_ms", "Long press (ms)", prefs.longPressMs)
 
-        heading("More")
-        buttons("Reload Harmonium" to {
+        section("Permissions (for Home Assistant controls)")
+        permissionsText = body("")
+        buttons(Triple("Screen off", false) {
+            startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this, ScreenOffAdmin::class.java))
+                .putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                    "Lets Home Assistant turn this remote's screen off."))
+        }, Triple("System settings", false) {
+            startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
+        }, Triple("Usage access", false) {
+            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+        })
+
+        section("More")
+        buttons(Triple("Reload Harmonium", false) {
             prefs.reloadPending = true
             finish()
-        }, "Android settings" to {
+        }, Triple("Android settings", false) {
             startActivity(Intent(Settings.ACTION_SETTINGS))
-        }, "Stock remote app" to {
+        })
+        buttons(Triple("Wi-Fi", false) {
+            startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
+        }, Triple("Stock remote app", false) {
             packageManager.getLaunchIntentForPackage("com.aiks.HaRemote")?.let { startActivity(it) }
                 ?: toast("com.aiks.HaRemote isn't installed")
         })
 
-        heading("")
-        buttons("Save" to ::save, "Close" to ::finish)
+        buttons(Triple("Save", true, ::save), Triple("Close", false, ::finish))
     }
 
     override fun onResume() {
         super.onResume()
-        showStatus()
+        statusText.text = statusSummary()
+        permissionsText.text = permissionSummary()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -219,7 +259,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun harmoniumInputs() =
         listOf(prefs.haUrl, prefs.harmoniumProfile, prefs.harmoniumPath, prefs.startPage, prefs.token)
-    private fun espInputs() = listOf(prefs.espName, prefs.espFriendlyName, prefs.activityEntity)
+    private fun espInputs() = listOf(prefs.espName, prefs.espFriendlyName, prefs.activityEntity, prefs.weatherEntity)
 
     /** Checks that the Harmonium page loads from the URL typed so far. */
     private fun test() {
@@ -263,8 +303,6 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
-    private fun showStatus() { statusText.text = statusSummary() }
-
     private fun statusSummary(): String {
         val mic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
@@ -274,7 +312,7 @@ class SettingsActivity : AppCompatActivity() {
             "Home Assistant (ESPHome): " + when {
                 HostState.voiceReady -> "connected, voice ready"
                 HostState.haConnected -> "connected, voice not subscribed yet"
-                else -> "not connected. Add the device in HA (see Voice assistant below)."
+                else -> "not connected. Add the device in HA (see below)."
             },
             "This remote: ${ipAddress() ?: "no Wi-Fi address"}, port ${EspServer.PORT}, name ${prefs.espName}",
             "Activity (${prefs.activityEntity}): ${HostState.activity ?: "unknown"}" +
@@ -285,6 +323,20 @@ class SettingsActivity : AppCompatActivity() {
         ).joinToString("\n")
     }
 
+    private fun permissionSummary(): String {
+        val admin = (getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager)
+            .isAdminActive(ComponentName(this, ScreenOffAdmin::class.java))
+        @Suppress("DEPRECATION")
+        val usage = (getSystemService(APP_OPS_SERVICE) as AppOpsManager).checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) == AppOpsManager.MODE_ALLOWED
+        fun mark(ok: Boolean) = if (ok) "✓" else "✗"
+        return listOf(
+            "${mark(admin)} Screen off: lets HA turn the screen off (device admin). Without it, \"off\" is a black screensaver.",
+            "${mark(Settings.System.canWrite(this))} Modify system settings: brightness, adaptive brightness, screen timeout.",
+            "${mark(usage)} Usage access: the foreground-app diagnostic.",
+        ).joinToString("\n")
+    }
+
     @Suppress("DEPRECATION") // WifiInfo.ipAddress is the simple way on API 27
     private fun ipAddress(): String? {
         val ip = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager).connectionInfo?.ipAddress ?: 0
@@ -292,45 +344,85 @@ class SettingsActivity : AppCompatActivity() {
         return "${ip and 0xFF}.${(ip shr 8) and 0xFF}.${(ip shr 16) and 0xFF}.${(ip shr 24) and 0xFF}"
     }
 
-    // ---------- tiny view builders ----------
+    // ---------- tiny view builders (Harmonium look) ----------
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
-    private fun heading(text: String, size: Float = 17f) {
-        list.addView(TextView(this).apply {
-            this.text = text
-            textSize = size
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, dp(18), 0, dp(4))
+    private fun title() {
+        page.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(12))
+            addView(TextView(this@SettingsActivity).apply {
+                text = "Harmonium Host"
+                textSize = 22f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(S.TEXT)
+            })
+            addView(TextView(this@SettingsActivity).apply {
+                text = "Version ${app.versionName} · swipe down from the top to come back here"
+                textSize = 12f
+                setTextColor(S.DIM)
+            })
         })
     }
 
-    private fun label(text: String) = TextView(this).apply {
+    /** Starts a new card; the builders below add to it. */
+    private fun section(title: String) {
+        card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = S.rounded(S.TILE, S.RADIUS_DP * resources.displayMetrics.density)
+            setPadding(dp(14), dp(12), dp(14), dp(14))
+        }
+        page.addView(card, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(12) })
+        card.addView(TextView(this).apply {
+            text = title.uppercase()
+            textSize = 12f
+            letterSpacing = 0.08f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(S.ACCENT)
+            setPadding(0, 0, 0, dp(4))
+        })
+    }
+
+    private fun body(text: String) = TextView(this).apply {
         this.text = text
+        textSize = 14f
+        setTextColor(S.TEXT)
+        setLineSpacing(0f, 1.15f)
         setPadding(0, dp(4), 0, dp(4))
-    }.also { list.addView(it) }
+    }.also { card.addView(it) }
 
     private fun note(text: String) {
-        list.addView(TextView(this).apply {
+        card.addView(TextView(this).apply {
             this.text = text
             textSize = 12f
-            alpha = 0.7f
-            setPadding(0, 0, 0, dp(6))
+            setTextColor(S.DIM)
+            setPadding(0, dp(2), 0, dp(6))
+        })
+    }
+
+    private fun label(title: String) {
+        card.addView(TextView(this).apply {
+            text = title
+            textSize = 13f
+            setTextColor(S.DIM)
+            setPadding(0, dp(10), 0, dp(4))
         })
     }
 
     private fun field(title: String, hint: String, value: String, type: Int): EditText {
-        if (title.isNotEmpty()) list.addView(TextView(this).apply {
-            text = title
-            textSize = 13f
-            setPadding(0, dp(8), 0, 0)
-        })
+        if (title.isNotEmpty()) label(title)
         return EditText(this).apply {
             inputType = type
             this.hint = hint
             setText(value)
-        }.also { list.addView(it, MATCH_PARENT, WRAP_CONTENT) }
+            setTextColor(S.TEXT)
+            setHintTextColor(S.FAINT)
+            textSize = 15f
+            background = S.focusable(S.TILE_HI, resources.displayMetrics.density)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }.also { card.addView(it, MATCH_PARENT, WRAP_CONTENT) }
     }
 
     /** A string setting. Blank saves as "use the default". */
@@ -350,37 +442,63 @@ class SettingsActivity : AppCompatActivity() {
         val s = Switch(this).apply {
             text = title
             isChecked = value
-            setPadding(0, dp(8), 0, dp(8))
+            textSize = 15f
+            setTextColor(S.TEXT)
+            thumbTintList = S.switchThumb
+            trackTintList = S.switchTrack
+            background = S.focusable(0, resources.displayMetrics.density, pressed = S.TILE_HI)
+            setPadding(dp(4), dp(10), dp(4), dp(10))
         }
-        list.addView(s, MATCH_PARENT, WRAP_CONTENT)
+        card.addView(s, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(4) })
         savers += { it.putBoolean(key, s.isChecked) }
     }
 
     private fun choice(key: String, title: String, options: List<Pair<String, String>>, value: String) {
-        list.addView(TextView(this).apply { text = title; textSize = 13f; setPadding(0, dp(8), 0, 0) })
+        label(title)
         var selected = options.indexOfFirst { it.first == value }.coerceAtLeast(0)
+        val labels = options.map { it.second }
         val spinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@SettingsActivity, android.R.layout.simple_spinner_dropdown_item,
-                options.map { it.second })
+            adapter = object : ArrayAdapter<String>(this@SettingsActivity,
+                android.R.layout.simple_spinner_dropdown_item, labels) {
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup) =
+                    styled(super.getView(position, convertView, parent))
+                override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup) =
+                    styled(super.getDropDownView(position, convertView, parent))
+                private fun styled(v: View) = v.apply { (this as? TextView)?.setTextColor(S.TEXT) }
+            }
+            background = S.focusable(S.TILE_HI, resources.displayMetrics.density)
+            setPopupBackgroundDrawable(S.rounded(S.TILE_HI, S.RADIUS_DP * resources.displayMetrics.density))
             setSelection(selected)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) { selected = pos }
                 override fun onNothingSelected(p: AdapterView<*>?) {}
             }
         }
-        list.addView(spinner, MATCH_PARENT, WRAP_CONTENT)
+        card.addView(spinner, MATCH_PARENT, WRAP_CONTENT)
         savers += { it.putString(key, options[selected].first) }
     }
 
-    private fun buttons(vararg items: Pair<String, () -> Unit>) {
+    /** A row of buttons: (label, primary, action). The primary one wears the accent. */
+    private fun buttons(vararg items: Triple<String, Boolean, () -> Unit>) {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((label, action) in items) {
+        val density = resources.displayMetrics.density
+        items.forEachIndexed { i, (label, primary, action) ->
             row.addView(Button(this).apply {
                 text = label
                 setAllCaps(false)
+                textSize = 14f
+                setTextColor(if (primary) S.ACCENT_INK else S.TEXT)
+                setTypeface(typeface, Typeface.BOLD)
+                background = if (primary) S.focusable(S.ACCENT, density, pressed = S.ACCENT, ringColor = S.TEXT)
+                             else S.focusable(S.TILE_HI, density)
+                stateListAnimator = null
+                minHeight = dp(46)
                 setOnClickListener { action() }
-            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply {
+                if (i > 0) leftMargin = dp(8)
+                topMargin = dp(8)
+            })
         }
-        list.addView(row, MATCH_PARENT, WRAP_CONTENT)
+        (if (::card.isInitialized) card else page).addView(row, MATCH_PARENT, WRAP_CONTENT)
     }
 }

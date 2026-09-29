@@ -14,17 +14,22 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
  * Makes the remote an ESPHome device in Home Assistant: a voice satellite (assist_satellite) plus
- * battery and charging entities, over the ESPHome native API (plain TCP, port 6053, no TLS, so it
+ * the entities in [entities], over the ESPHome native API (plain TCP, port 6053, no TLS, so it
  * works with an http-only HA). HA is the client: it discovers the remote over mDNS (or is given
  * its IP), connects, and keeps the connection open.
  *
- * Only the messages a voice satellite needs are implemented; everything else is ignored. The
- * protocol is ESPHome's api.proto (message ids and field numbers are noted inline).
- * Also carries the activity select's state: the remote asks HA to forward it (no token needed).
+ * Only the messages this device needs are implemented; everything else is ignored. The protocol
+ * is ESPHome's api.proto (message ids and field numbers are noted inline).
+ *
+ * Threading: every write goes through one writer thread ([io]), so callers on any thread (the
+ * main thread included) never touch the network. Each connection has its own reader thread.
  */
 class EspServer(private val context: Context, private val prefs: HostPrefs) {
 
@@ -37,9 +42,11 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
     companion object {
         const val PORT = 6053
         private const val TAG = "HarmoniumHost"
-        /** We speak API 1.12: new enough for voice feature flags (1.10), below the object_id-optional change (1.14). */
+        /** API 1.12: new enough for voice feature flags (1.10), below the object_id-optional change (1.14). */
         private const val API_MINOR = 12L
         private const val ESPHOME_VERSION = "2025.9.0"
+        private const val REFRESH_S = 60L
+        private const val CAMERA_CHUNK = 8 * 1024
 
         // message ids (api.proto `option (id)`)
         private const val HELLO_REQ = 1; private const val HELLO_RESP = 2
@@ -50,13 +57,29 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private const val LIST_ENTITIES_REQ = 11
         private const val LIST_BINARY_SENSOR = 12
         private const val LIST_SENSOR = 16
+        private const val LIST_SWITCH = 17
+        private const val LIST_TEXT_SENSOR = 18
         private const val LIST_DONE = 19
         private const val SUBSCRIBE_STATES = 20
         private const val BINARY_SENSOR_STATE = 21
         private const val SENSOR_STATE = 25
+        private const val SWITCH_STATE = 26
+        private const val TEXT_SENSOR_STATE = 27
+        private const val SWITCH_COMMAND = 33
         private const val SUBSCRIBE_HA_STATES = 38
         private const val SUBSCRIBE_HA_STATE = 39
         private const val HA_STATE = 40
+        private const val LIST_CAMERA = 43
+        private const val CAMERA_IMAGE = 44
+        private const val CAMERA_REQUEST = 45
+        private const val LIST_NUMBER = 49
+        private const val NUMBER_STATE = 50
+        private const val NUMBER_COMMAND = 51
+        private const val LIST_SELECT = 52
+        private const val SELECT_STATE = 53
+        private const val SELECT_COMMAND = 54
+        private const val LIST_BUTTON = 61
+        private const val BUTTON_COMMAND = 62
         private const val SUBSCRIBE_VOICE = 89
         private const val VOICE_REQUEST = 90
         private const val VOICE_RESPONSE = 91
@@ -75,18 +98,21 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         const val EVENT_STT_END = 4
         const val EVENT_INTENT_END = 6
         const val EVENT_TTS_END = 8
-
-        private const val KEY_BATTERY = 1
-        private const val KEY_CHARGING = 2
     }
 
+    /** Set once by HostService before [start]. */
+    @Volatile var entities: List<EspEntity> = emptyList()
+    /** (entity_id, attribute) pairs HA should forward; attribute "" = the state. */
+    @Volatile var haSubscriptions: () -> List<Pair<String, String>> = { emptyList() }
+    @Volatile var onHaState: (entityId: String, attribute: String, state: String) -> Unit = { _, _, _ -> }
+    @Volatile var voiceListener: VoiceListener? = null
+
+    private val io = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "esphome-io").apply { isDaemon = true } }
+    private val refreshQueued = AtomicBoolean(false)
     private val connections = CopyOnWriteArrayList<Conn>()
     @Volatile private var voiceConn: Conn? = null
-    @Volatile var voiceListener: VoiceListener? = null
     @Volatile private var server: ServerSocket? = null
     private var nsd: NsdManager.RegistrationListener? = null
-    private var batteryLevel = -1
-    private var charging = false
 
     /** HA has subscribed to this remote's voice assistant: push-to-talk can run. */
     val voiceReady get() = voiceConn != null
@@ -101,7 +127,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 while (!ss.isClosed) {
                     val s = ss.accept()
                     s.tcpNoDelay = true
-                    s.soTimeout = 150_000          // HA pings every ~20 s; silence this long = gone
+                    s.soTimeout = 150_000          // HA pings every 20 s; silence this long = gone
                     val c = Conn(s)
                     connections += c
                     thread(name = "esphome-conn", isDaemon = true) { c.run() }
@@ -111,6 +137,8 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 server = null
             }
         }
+        // Diagnostics drift slowly; a sleeping CPU simply delays this, it never wakes it.
+        io.scheduleWithFixedDelay({ refresh() }, REFRESH_S, REFRESH_S, TimeUnit.SECONDS)
         advertise()
     }
 
@@ -120,14 +148,44 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         unadvertise()
     }
 
-    /** Name, friendly name or activity entity changed: re-announce, and let HA reconnect to pick it up. */
+    /** Name, friendly name or subscriptions changed: re-announce, and let HA reconnect to pick it up. */
     fun reload() {
         connections.forEach { it.close() }
         unadvertise()
         advertise()
     }
 
-    // ---------- outgoing, used by VoiceSatellite and HostService ----------
+    /** Re-reads every entity and sends the ones that changed. Cheap; coalesced; callable from any thread. */
+    fun refresh() {
+        if (!refreshQueued.compareAndSet(false, true)) return
+        io.execute {
+            refreshQueued.set(false)
+            val live = connections.filter { it.statesWanted }
+            if (live.isEmpty()) return@execute
+            for (e in entities) {
+                val msg = try { stateMessage(e) } catch (ex: Exception) { Log.w(TAG, "read ${e.objectId}: $ex"); null } ?: continue
+                live.forEach { it.sendIfChanged(e.key, msg) }
+            }
+        }
+    }
+
+    /** Captures and sends a fresh image for [cam] to every connection. */
+    fun pushImage(cam: EspCamera) {
+        thread(name = "esphome-camera") {
+            val jpeg = try { cam.capture() } catch (e: Exception) { Log.w(TAG, "screenshot: $e"); null } ?: return@thread
+            var off = 0
+            while (off < jpeg.size) {
+                val n = minOf(CAMERA_CHUNK, jpeg.size - off)
+                val last = off + n >= jpeg.size
+                val msg = ProtoWriter().fixed32(1, cam.key).bytes(2, jpeg.copyOfRange(off, off + n))
+                    .bool(3, last).toByteArray()
+                connections.forEach { it.send(CAMERA_IMAGE, msg) }
+                off += n
+            }
+        }
+    }
+
+    // ---------- voice, used by VoiceSatellite ----------
 
     fun sendVoiceStart(conversationId: String): Boolean = voiceConn?.send(VOICE_REQUEST, ProtoWriter()
         .bool(1, true)                       // start
@@ -145,11 +203,59 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
     /** end=true: the key was released; HA finishes speech-to-text with what it has. */
     fun sendAudioEnd() { voiceConn?.send(VOICE_AUDIO, ProtoWriter().bool(2, true).toByteArray()) }
 
-    fun publishBattery(level: Int, charging: Boolean) {
-        if (level == batteryLevel && charging == this.charging) return
-        batteryLevel = level
-        this.charging = charging
-        connections.filter { it.statesWanted }.forEach { it.sendStates() }
+    // ---------- entity encoding ----------
+
+    private fun listMessage(e: EspEntity): Pair<Int, ByteArray> {
+        val w = ProtoWriter().string(1, e.objectId).fixed32(2, e.key).string(3, e.name)
+        return when (e) {
+            is EspSensor -> LIST_SENSOR to w.string(5, e.icon).string(6, e.unit).uint(7, e.decimals.toLong())
+                .string(9, e.deviceClass).uint(10, e.stateClass.toLong()).uint(13, e.category.toLong()).toByteArray()
+            is EspBinarySensor -> LIST_BINARY_SENSOR to w.string(5, e.deviceClass).string(8, e.icon)
+                .uint(9, e.category.toLong()).toByteArray()
+            is EspTextSensor -> LIST_TEXT_SENSOR to w.string(5, e.icon).uint(7, e.category.toLong())
+                .string(8, e.deviceClass).toByteArray()
+            is EspSwitch -> LIST_SWITCH to w.string(5, e.icon).uint(8, e.category.toLong()).toByteArray()
+            is EspNumber -> LIST_NUMBER to w.string(5, e.icon).float(6, e.min).float(7, e.max).float(8, e.step)
+                .uint(10, e.category.toLong()).string(11, e.unit).uint(12, 2).toByteArray()   // mode: slider
+            is EspSelect -> LIST_SELECT to w.string(5, e.icon).apply { e.options.forEach { string(6, it) } }
+                .uint(8, e.category.toLong()).toByteArray()
+            is EspButton -> LIST_BUTTON to w.string(5, e.icon).uint(7, e.category.toLong()).toByteArray()
+            is EspCamera -> LIST_CAMERA to w.string(6, e.icon).uint(7, e.category.toLong()).toByteArray()
+        }
+    }
+
+    /** The state message for [e], or null for entities without a state (buttons, cameras). */
+    private fun stateMessage(e: EspEntity): Pair<Int, ByteArray>? {
+        val w = ProtoWriter().fixed32(1, e.key)
+        return when (e) {
+            is EspSensor -> e.read().let { v -> SENSOR_STATE to w.float(2, v ?: 0f).bool(3, v == null || v.isNaN()).toByteArray() }
+            is EspBinarySensor -> e.read().let { v -> BINARY_SENSOR_STATE to w.bool(2, v == true).bool(3, v == null).toByteArray() }
+            is EspTextSensor -> e.read().let { v -> TEXT_SENSOR_STATE to w.string(2, (v ?: "").take(255)).bool(3, v == null).toByteArray() }
+            is EspSwitch -> e.read().let { v -> SWITCH_STATE to w.bool(2, v == true).bool(4, v == null).toByteArray() }
+            is EspNumber -> e.read().let { v -> NUMBER_STATE to w.float(2, v ?: 0f).bool(3, v == null).toByteArray() }
+            is EspSelect -> e.read().let { v -> SELECT_STATE to w.string(2, v ?: "").bool(3, v == null).toByteArray() }
+            is EspButton, is EspCamera -> null
+        }
+    }
+
+    private fun entity(key: Int) = entities.firstOrNull { it.key == key }
+
+    private fun command(type: Int, payload: ByteArray) {
+        val r = ProtoReader(payload)
+        val e = entity(r.fixed32(1)) ?: return
+        Log.i(TAG, "ESPHome: command for ${e.objectId}")
+        try {
+            when {
+                type == SWITCH_COMMAND && e is EspSwitch -> e.write(r.bool(2))
+                type == NUMBER_COMMAND && e is EspNumber -> e.write(r.float(2))
+                type == SELECT_COMMAND && e is EspSelect -> e.write(r.string(2))
+                type == BUTTON_COMMAND && e is EspButton -> e.press()
+            }
+        } catch (ex: Exception) {
+            Log.w(TAG, "command ${e.objectId} failed: $ex")
+        }
+        // Report the result once the command has taken effect.
+        io.schedule({ refresh() }, 700, TimeUnit.MILLISECONDS)
     }
 
     // ---------- mDNS (how HA discovers ESPHome devices) ----------
@@ -193,7 +299,10 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private val input: InputStream = BufferedInputStream(socket.getInputStream())
         private val out = BufferedOutputStream(socket.getOutputStream())
         private val peer = socket.inetAddress?.hostAddress ?: "?"
+        @Volatile private var closed = false
         @Volatile var statesWanted = false
+        /** Last state payload sent per entity key (writer thread only). */
+        private val sent = HashMap<Int, ByteArray>()
 
         fun run() {
             Log.i(TAG, "ESPHome: Home Assistant connected from $peer")
@@ -237,21 +346,35 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             return -1
         }
 
-        fun send(type: Int, payload: ByteArray): Boolean = synchronized(this) {
+        /** Queues a frame on the writer thread. Returns false once the connection is gone. */
+        fun send(type: Int, payload: ByteArray): Boolean {
+            if (closed) return false
+            io.execute { write(type, payload) }
+            return true
+        }
+
+        private fun write(type: Int, payload: ByteArray) {
+            if (closed) return
             try {
                 out.write(0)
                 out.write(ProtoWriter.varintBytes(payload.size))
                 out.write(ProtoWriter.varintBytes(type))
                 out.write(payload)
                 out.flush()
-                true
             } catch (e: IOException) {
                 close()
-                false
             }
         }
 
+        /** Writer thread only. */
+        fun sendIfChanged(key: Int, msg: Pair<Int, ByteArray>) {
+            if (sent[key]?.contentEquals(msg.second) == true) return
+            sent[key] = msg.second
+            write(msg.first, msg.second)
+        }
+
         fun close() {
+            closed = true
             if (!connections.remove(this)) return
             try { socket.close() } catch (e: IOException) {}
             if (voiceConn === this) {
@@ -273,33 +396,28 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                     HostState.setHaConnected(true)
                 }
                 AUTH_REQ -> send(AUTH_RESP, ByteArray(0))          // no password
-                DISCONNECT_REQ -> { send(DISCONNECT_RESP, ByteArray(0)); close() }
+                DISCONNECT_REQ -> { send(DISCONNECT_RESP, ByteArray(0)); io.execute { close() } }
                 PING_REQ -> send(PING_RESP, ByteArray(0))
                 DEVICE_INFO_REQ -> send(DEVICE_INFO_RESP, deviceInfo())
                 LIST_ENTITIES_REQ -> {
-                    send(LIST_SENSOR, ProtoWriter()
-                        .string(1, "battery").fixed32(2, KEY_BATTERY).string(3, "Battery")
-                        .string(6, "%").string(9, "battery")         // unit, device_class
-                        .uint(10, 1)                            // state_class: measurement
-                        .toByteArray())
-                    send(LIST_BINARY_SENSOR, ProtoWriter()
-                        .string(1, "charging").fixed32(2, KEY_CHARGING).string(3, "Charging")
-                        .string(5, "battery_charging")                // device_class
-                        .toByteArray())
+                    entities.forEach { e -> listMessage(e).let { send(it.first, it.second) } }
                     send(LIST_DONE, ByteArray(0))
                 }
-                SUBSCRIBE_STATES -> { statesWanted = true; sendStates() }
-                // HA forwards this entity's state from now on (no token or permission needed).
-                SUBSCRIBE_HA_STATES -> prefs.activityEntity.takeIf { it.isNotEmpty() }?.let {
-                    send(SUBSCRIBE_HA_STATE, ProtoWriter().string(1, it).toByteArray())
+                SUBSCRIBE_STATES -> {
+                    statesWanted = true
+                    io.execute { sent.clear() }
+                    refresh()
+                }
+                // HA forwards these entities' states from now on (no token or permission needed).
+                SUBSCRIBE_HA_STATES -> haSubscriptions().forEach { (entity, attr) ->
+                    if (entity.isNotEmpty()) send(SUBSCRIBE_HA_STATE, ProtoWriter().string(1, entity).string(2, attr).toByteArray())
                 }
                 HA_STATE -> {
                     val r = ProtoReader(payload)
-                    if (r.string(1) == prefs.activityEntity && r.string(3).isEmpty()) {
-                        Log.i(TAG, "activity: ${r.string(2)}")
-                        HostState.setActivity(r.string(2), prefs.idleStates)
-                    }
+                    onHaState(r.string(1), r.string(3), r.string(2))
                 }
+                SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND -> command(type, payload)
+                CAMERA_REQUEST -> entities.filterIsInstance<EspCamera>().firstOrNull()?.let { pushImage(it) }
                 SUBSCRIBE_VOICE -> {
                     val r = ProtoReader(payload)
                     if (r.bool(1)) {
@@ -310,10 +428,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                     }
                     HostState.setVoiceReady(voiceConn != null)
                 }
-                VOICE_RESPONSE -> {
-                    val r = ProtoReader(payload)
-                    voiceListener?.onVoiceResponse(r.bool(2))
-                }
+                VOICE_RESPONSE -> voiceListener?.onVoiceResponse(ProtoReader(payload).bool(2))
                 VOICE_EVENT -> {
                     val r = ProtoReader(payload)
                     val data = r.messages(2).associate { it.string(1) to it.string(2) }
@@ -323,13 +438,6 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 VOICE_AUDIO -> {}                                     // only with SPEAKER, which we don't claim
                 else -> Log.d(TAG, "ESPHome: ignoring message $type")
             }
-        }
-
-        fun sendStates() {
-            val level = batteryLevel
-            send(SENSOR_STATE, ProtoWriter().fixed32(1, KEY_BATTERY).float(2, level.toFloat())
-                .bool(3, level < 0).toByteArray())
-            send(BINARY_SENSOR_STATE, ProtoWriter().fixed32(1, KEY_CHARGING).bool(2, charging).toByteArray())
         }
 
         private fun deviceInfo() = ProtoWriter()
