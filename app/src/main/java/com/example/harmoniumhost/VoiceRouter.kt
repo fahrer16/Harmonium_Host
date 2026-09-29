@@ -16,9 +16,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
 import okio.BufferedSink
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
@@ -29,28 +26,33 @@ import kotlin.concurrent.thread
 
 /**
  * Push-to-talk: hold the mic key, speak, release.
- * The route is decided per utterance by an HA entity (prefs.siriEntity):
- *   on  -> stream PCM to appletv_siri's per-Apple-TV endpoint (Siri on that TV)
- *   off -> run an Assist pipeline over HA's websocket and play the TTS reply
+ * Default route: Home Assistant Assist over the shared websocket ([HaLink]); the TTS reply plays on
+ * the remote's speaker. Optional (Settings): when Siri routing is on, an HA entity decides per
+ * utterance whether the audio goes to appletv_siri instead.
  * Capture is native AudioRecord, so there's no browser getUserMedia and plain-http HA is fine.
  */
 class VoiceRouter(
     private val context: Context,
     private val prefs: HostPrefs,
+    private val link: HaLink,
+    private val http: OkHttpClient,
     private val status: (text: String, done: Boolean) -> Unit,
 ) {
     private companion object {
         const val TAG = "HarmoniumHost"
         const val RATE = 16_000               // PCM16 mono 16 kHz: what HA STT and appletv_siri both take
         const val CHUNK = RATE * 2 / 10       // 100 ms of audio
+        const val MIN_SPEECH_BYTES = RATE * 2 * 3 / 10   // < 0.3 s held = an accidental tap
         const val MAX_UTTERANCE_MS = 15_000L
+        const val CONVERSATION_MS = 5 * 60_000L          // follow-ups within this reuse the conversation
     }
 
-    private val http = OkHttpClient.Builder().readTimeout(30, TimeUnit.SECONDS).build()
     private val quick = http.newBuilder().callTimeout(800, TimeUnit.MILLISECONDS).build()
 
     @Volatile private var busy = false       // a session (capture + response) is in progress
     @Volatile private var capturing = false  // mic key is held
+    private var conversationId: String? = null
+    private var conversationAt = 0L
 
     fun start() {
         if (busy) return
@@ -58,13 +60,15 @@ class VoiceRouter(
             != PackageManager.PERMISSION_GRANTED) {
             status("Microphone permission not granted", true); return
         }
+        if (prefs.token.isEmpty()) { status("No Home Assistant token yet: see Settings", true); return }
         busy = true
         capturing = true
+        link.want("voice", true)                  // usually already up while the screen is on
         thread(name = "voice") {
             var rec: AudioRecord? = null
             try {
-                rec = openMic()               // capture first; its ~1 s buffer absorbs the route lookup
-                val siri = routeToSiri()
+                rec = openMic()                   // capture first; its buffer absorbs the setup time
+                val siri = prefs.siriEnabled && routeToSiri()
                 status(if (siri) "Listening · Siri" else "Listening…", false)
                 if (siri) streamToSiri(rec) else runAssist(rec)
             } catch (e: Exception) {
@@ -74,6 +78,7 @@ class VoiceRouter(
                 capturing = false
                 busy = false
                 rec?.release()
+                link.want("voice", false)
             }
         }
     }
@@ -84,22 +89,25 @@ class VoiceRouter(
     @SuppressLint("MissingPermission") // checked in start()
     private fun openMic(): AudioRecord {
         val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        // 3 s of buffer: covers connecting to HA if the link wasn't up yet.
         val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE,
-            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, RATE * 2))
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, RATE * 2 * 3))
         check(rec.state == AudioRecord.STATE_INITIALIZED) { "microphone unavailable" }
         rec.startRecording()
         return rec
     }
 
-    /** Feeds 100 ms chunks to [sink] until the key is released (or the safety cap is hit). */
-    private fun pump(rec: AudioRecord, sink: (ByteArray, Int) -> Unit) {
+    /** Feeds 100 ms chunks to [sink] until the key is released (or the safety cap is hit). Returns bytes sent. */
+    private fun pump(rec: AudioRecord, sink: (ByteArray, Int) -> Unit): Int {
         val buf = ByteArray(CHUNK)
         val deadline = SystemClock.elapsedRealtime() + MAX_UTTERANCE_MS
+        var total = 0
         while (capturing && SystemClock.elapsedRealtime() < deadline) {
             val n = rec.read(buf, 0, buf.size)
-            if (n > 0) sink(buf, n)
+            if (n > 0) { sink(buf, n); total += n }
         }
         rec.stop()
+        return total
     }
 
     private fun routeToSiri(): Boolean = try {
@@ -115,7 +123,111 @@ class VoiceRouter(
         false
     }
 
-    // ---------- Siri route (appletv_siri) ----------
+    // ---------- Assist route (HA websocket assist_pipeline/run) ----------
+
+    private fun runAssist(rec: AudioRecord) {
+        if (!link.awaitReady(4_000)) {
+            capturing = false
+            status("Can't reach Home Assistant", true)
+            return
+        }
+        val handlerId = AtomicInteger(-1)
+        val finished = CountDownLatch(1)
+        val runId = link.send(pipelineRun()) { msg ->
+            when (msg.optString("type")) {
+                "result" -> if (!msg.optBoolean("success")) {
+                    status("Assist: ${msg.optJSONObject("error")?.optString("message")}", true)
+                    finished.countDown()
+                }
+                "event" -> msg.optJSONObject("event")?.let { onPipelineEvent(it, handlerId, finished) }
+                "link_down" -> { status("Lost connection to Home Assistant", true); finished.countDown() }
+            }
+        }
+        if (runId < 0) { capturing = false; status("Can't reach Home Assistant", true); return }
+
+        // run-start hands us the binary handler id; AudioRecord keeps buffering meanwhile.
+        val waitUntil = SystemClock.elapsedRealtime() + 3_000
+        while (handlerId.get() < 0 && finished.count > 0 && SystemClock.elapsedRealtime() < waitUntil) {
+            Thread.sleep(10)
+        }
+        val id = handlerId.get()
+        if (id < 0) {
+            capturing = false
+            if (finished.count > 0) status("Assist didn't start", true)
+            link.forget(runId)
+            return
+        }
+
+        val sent = pump(rec) { b, n ->
+            val frame = ByteArray(n + 1)
+            frame[0] = id.toByte()                        // every audio frame is prefixed with the handler id
+            System.arraycopy(b, 0, frame, 1, n)
+            link.sendBinary(frame.toByteString())
+        }
+        link.sendBinary(byteArrayOf(id.toByte()).toByteString())  // handler id alone = end of audio
+        if (sent < MIN_SPEECH_BYTES) {
+            link.forget(runId)
+            status("Hold the mic button while you speak", true)
+            return
+        }
+        status("Thinking…", false)
+        finished.await(20, TimeUnit.SECONDS)
+        link.forget(runId)
+    }
+
+    private fun pipelineRun() = JSONObject()
+        .put("type", "assist_pipeline/run")
+        .put("start_stage", "stt")
+        .put("end_stage", "tts")
+        // no_vad: push-to-talk, so the release ends the utterance, not HA's silence detector.
+        .put("input", JSONObject().put("sample_rate", RATE).put("no_vad", true))
+        .apply {
+            if (prefs.pipelineId.isNotEmpty()) put("pipeline", prefs.pipelineId)
+            val convo = conversationId
+            if (convo != null && SystemClock.elapsedRealtime() - conversationAt < CONVERSATION_MS) {
+                put("conversation_id", convo)
+            }
+        }
+
+    private fun onPipelineEvent(event: JSONObject, handlerId: AtomicInteger, finished: CountDownLatch) {
+        val data = event.optJSONObject("data")
+        when (event.optString("type")) {
+            "run-start" -> handlerId.set(
+                data?.optJSONObject("runner_data")?.optInt("stt_binary_handler_id", -1) ?: -1)
+            "stt-end" -> data?.optJSONObject("stt_output")?.optString("text")
+                ?.takeIf { it.isNotBlank() }?.let { status("“$it”", false) }
+            "intent-end" -> data?.optJSONObject("intent_output")?.let { out ->
+                out.optString("conversation_id").takeIf { it.isNotBlank() }?.let {
+                    conversationId = it
+                    conversationAt = SystemClock.elapsedRealtime()
+                }
+                out.optJSONObject("response")?.optJSONObject("speech")?.optJSONObject("plain")
+                    ?.optString("speech")?.takeIf { it.isNotBlank() }?.let { status(it, true) }
+            }
+            "tts-end" -> data?.optJSONObject("tts_output")?.optString("url")
+                ?.takeIf { it.isNotBlank() }?.let { play(it) }
+            "error" -> { status("Assist: ${data?.optString("message")}", true); finished.countDown() }
+            "run-end" -> finished.countDown()
+        }
+    }
+
+    /** Plays the TTS reply on the remote's own speaker. */
+    private fun play(path: String) {
+        val url = if (path.startsWith("http")) path else prefs.haUrl + path
+        MediaPlayer().apply {
+            setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build())
+            setDataSource(url)
+            setOnPreparedListener { it.start() }
+            setOnCompletionListener { it.release() }
+            setOnErrorListener { mp, _, _ -> mp.release(); true }
+            prepareAsync()
+        }
+    }
+
+    // ---------- Siri route (appletv_siri), only when enabled in Settings ----------
 
     private fun streamToSiri(rec: AudioRecord) {
         val body = object : RequestBody() {
@@ -134,99 +246,6 @@ class VoiceRouter(
         http.newCall(req).execute().use { r ->
             Log.i(TAG, "siri: ${r.code} ${r.body?.string().orEmpty()}")
             status(if (r.isSuccessful) "Sent to Siri" else "Siri route failed (${r.code})", true)
-        }
-    }
-
-    // ---------- Assist route (HA websocket assist_pipeline/run) ----------
-
-    private fun runAssist(rec: AudioRecord) {
-        val handlerId = AtomicInteger(-1)
-        val finished = CountDownLatch(1)
-        val wsUrl = prefs.haUrl.replaceFirst("http", "ws") + "/api/websocket"
-
-        val ws = http.newWebSocket(Request.Builder().url(wsUrl).build(), object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                val msg = JSONObject(text)
-                when (msg.optString("type")) {
-                    "auth_required" -> webSocket.send(
-                        JSONObject().put("type", "auth").put("access_token", prefs.token).toString())
-                    "auth_ok" -> webSocket.send(pipelineRun().toString())
-                    "auth_invalid" -> { status("HA rejected the token", true); finished.countDown() }
-                    "result" -> if (!msg.optBoolean("success")) {
-                        status("Assist: ${msg.optJSONObject("error")?.optString("message")}", true)
-                        finished.countDown()
-                    }
-                    "event" -> onPipelineEvent(msg.getJSONObject("event"), handlerId, finished)
-                }
-            }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                status("HA connection failed", true)
-                finished.countDown()
-            }
-        })
-
-        // run-start hands us the binary handler id; AudioRecord keeps buffering meanwhile.
-        val waitUntil = SystemClock.elapsedRealtime() + 3_000
-        while (handlerId.get() < 0 && finished.count > 0 && SystemClock.elapsedRealtime() < waitUntil) {
-            Thread.sleep(10)
-        }
-        val id = handlerId.get()
-        if (id < 0) {
-            if (finished.count > 0) status("Assist didn't start", true)
-            ws.close(1000, null)
-            return
-        }
-
-        pump(rec) { b, n ->
-            val frame = ByteArray(n + 1)
-            frame[0] = id.toByte()                        // every audio frame is prefixed with the handler id
-            System.arraycopy(b, 0, frame, 1, n)
-            ws.send(frame.toByteString())
-        }
-        ws.send(byteArrayOf(id.toByte()).toByteString())  // handler id alone = end of audio
-        status("Thinking…", false)
-        finished.await(20, TimeUnit.SECONDS)
-        ws.close(1000, null)
-    }
-
-    private fun pipelineRun() = JSONObject()
-        .put("id", 1)
-        .put("type", "assist_pipeline/run")
-        .put("start_stage", "stt")
-        .put("end_stage", "tts")
-        .put("input", JSONObject().put("sample_rate", RATE))
-        .apply { if (prefs.pipelineId.isNotEmpty()) put("pipeline", prefs.pipelineId) }
-
-    private fun onPipelineEvent(event: JSONObject, handlerId: AtomicInteger, finished: CountDownLatch) {
-        val data = event.optJSONObject("data")
-        when (event.optString("type")) {
-            "run-start" -> handlerId.set(
-                data?.optJSONObject("runner_data")?.optInt("stt_binary_handler_id", -1) ?: -1)
-            "stt-end" -> data?.optJSONObject("stt_output")?.optString("text")
-                ?.takeIf { it.isNotBlank() }?.let { status("“$it”", false) }
-            "intent-end" -> data?.optJSONObject("intent_output")?.optJSONObject("response")
-                ?.optJSONObject("speech")?.optJSONObject("plain")?.optString("speech")
-                ?.takeIf { it.isNotBlank() }?.let { status(it, true) }
-            "tts-end" -> data?.optJSONObject("tts_output")?.optString("url")
-                ?.takeIf { it.isNotBlank() }?.let { play(it) }
-            "error" -> { status("Assist: ${data?.optString("message")}", true); finished.countDown() }
-            "run-end" -> finished.countDown()
-        }
-    }
-
-    /** Plays the TTS reply on the remote's own speaker, if it has a usable one. */
-    private fun play(path: String) {
-        val url = if (path.startsWith("http")) path else prefs.haUrl + path
-        MediaPlayer().apply {
-            setAudioAttributes(AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build())
-            setDataSource(url)
-            setOnPreparedListener { it.start() }
-            setOnCompletionListener { it.release() }
-            setOnErrorListener { mp, _, _ -> mp.release(); true }
-            prepareAsync()
         }
     }
 }

@@ -16,109 +16,173 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
-import kotlin.math.abs
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Always-running companion to MainActivity:
- *  - on the cradle: wake briefly and show a charging screen
+ *  - battery and cradle state for the status line and the charging screen
+ *  - on the cradle: wake briefly so the charging screen is seen
  *  - off the cradle: wake immediately (you're about to use it)
- *  - pickup detection: wake before your thumb reaches a button
- *  - Wi-Fi lock: keep the HA connection warm through screen-off
+ *  - proximity (the device's only wake-up sensor): wake when a hand comes near
+ *  - while the screen is on: HA link up (activity state) and Wi-Fi out of power save
  */
-class HostService : Service() {
+class HostService : Service(), SensorEventListener {
 
     companion object {
-        const val ACTION_CHARGING = "com.example.harmoniumhost.CHARGING"
-        const val ACTION_UNPLUGGED = "com.example.harmoniumhost.UNPLUGGED"
-        const val EXTRA_LEVEL = "level"
+        /** Sent by Settings after a save. */
+        const val ACTION_RELOAD = "com.example.harmoniumhost.RELOAD"
         private const val TAG = "HarmoniumHost"
         private const val CHANNEL = "host"
-        private const val PICKUP_THRESHOLD = 2.5f   // m/s², summed across axes. Tune on the device.
+        private const val PROXIMITY_WAKE_GAP_MS = 3_000L
+
+        fun reload(context: Context) = ContextCompat.startForegroundService(
+            context, Intent(context, HostService::class.java).setAction(ACTION_RELOAD))
     }
 
+    private lateinit var app: HostApp
     private lateinit var power: PowerManager
+    private lateinit var sensors: SensorManager
     private var wifiLock: WifiManager.WifiLock? = null
-    private var sensors: SensorManager? = null
+    private var proximity: Sensor? = null
+    private var lastProximityWake = 0L
+    private val clock = SimpleDateFormat("HH:mm:ss", Locale.US)
 
-    // Must be registered at runtime: since Android 8.0, manifest receivers don't get POWER_CONNECTED.
-    private val powerEvents = object : BroadcastReceiver() {
+    // Must be registered at runtime: manifest receivers don't get these since Android 8.0.
+    private val events = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_POWER_CONNECTED -> { wakeScreen(4_000); broadcast(ACTION_CHARGING) }
-                Intent.ACTION_POWER_DISCONNECTED -> { wakeScreen(15_000); broadcast(ACTION_UNPLUGGED) }
+                Intent.ACTION_POWER_CONNECTED -> {
+                    HostState.fire(HostState.Event.PLUGGED)
+                    if (app.prefs.chargeScreenSec > 0) wakeScreen(app.prefs.chargeScreenSec * 1000L)
+                }
+                Intent.ACTION_POWER_DISCONNECTED -> {
+                    HostState.fire(HostState.Event.UNPLUGGED)
+                    wakeScreen(10_000)
+                }
+                Intent.ACTION_BATTERY_CHANGED -> {
+                    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                    val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                    val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+                    HostState.setBattery(
+                        if (level >= 0 && scale > 0) level * 100 / scale else -1,
+                        plugged,
+                        plugged && status == BatteryManager.BATTERY_STATUS_FULL)
+                }
+                Intent.ACTION_SCREEN_ON -> screen(true)
+                Intent.ACTION_SCREEN_OFF -> screen(false)
             }
         }
-    }
-
-    private val pickup = object : SensorEventListener {
-        private val last = FloatArray(3)
-        private var primed = false
-        override fun onSensorChanged(e: SensorEvent) {
-            val delta = abs(e.values[0] - last[0]) + abs(e.values[1] - last[1]) + abs(e.values[2] - last[2])
-            e.values.copyInto(last, endIndex = 3)
-            if (primed && delta > PICKUP_THRESHOLD && !power.isInteractive) {
-                Log.i(TAG, "pickup detected (delta=$delta), waking")
-                wakeScreen(10_000)
-            }
-            primed = true
-        }
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
 
     override fun onCreate() {
         super.onCreate()
+        app = HostApp.of(this)
         power = getSystemService(POWER_SERVICE) as PowerManager
+        sensors = getSystemService(SENSOR_SERVICE) as SensorManager
         startForeground(1, notification())
 
-        ContextCompat.registerReceiver(this, powerEvents, IntentFilter().apply {
+        app.watcher   // create it so it hears the link come up
+        val sticky = ContextCompat.registerReceiver(this, events, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
         }, ContextCompat.RECEIVER_NOT_EXPORTED)
+        // BATTERY_CHANGED is sticky: the current state comes back from registerReceiver.
+        sticky?.let { events.onReceive(this, it) }
 
-        // Keeps Wi-Fi out of power-save so the websocket survives screen-off. Measure battery impact.
+        // High-perf only while the screen is on (keys land fast); normal power save while it's off.
         @Suppress("DEPRECATION")
         wifiLock = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "harmoniumhost:wifi")
-            .apply { setReferenceCounted(false); acquire() }
+            .apply { setReferenceCounted(false) }
 
-        // EXPERIMENTAL pickup-to-wake. Only a *wake-up* accelerometer delivers events while the SoC
-        // sleeps. It costs battery (it wakes the CPU to deliver each batch), so measure it and consider
-        // enabling it only while an activity is running and the remote is off the cradle.
-        sensors = getSystemService(SENSOR_SERVICE) as SensorManager
-        val accel = sensors?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER, true)
-        if (accel != null) {
-            sensors?.registerListener(pickup, accel, SensorManager.SENSOR_DELAY_NORMAL, 500_000)
-            Log.i(TAG, "pickup wake using ${accel.name}")
-        } else {
-            Log.w(TAG, "no wake-up accelerometer; check `dumpsys sensorservice` for a tilt/pickup sensor")
-        }
+        screen(power.isInteractive)
+        applySettings()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RELOAD) {
+            applySettings()
+            app.link.restart()
+        }
+        return START_STICKY
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        unregisterReceiver(powerEvents)
-        sensors?.unregisterListener(pickup)
+        unregisterReceiver(events)
+        sensors.unregisterListener(this)
         wifiLock?.release()
+        app.link.want("screen", false)
         super.onDestroy()
     }
 
+    private fun screen(on: Boolean) {
+        app.link.want("screen", on)
+        if (on) {
+            wifiLock?.acquire()
+            HostState.fire(HostState.Event.SCREEN_ON)
+        } else {
+            wifiLock?.release()
+        }
+    }
+
+    // ---------- proximity ----------
+
+    private fun applySettings() {
+        val want = app.prefs.proximityWake
+        if (want && proximity == null) {
+            // The only wake-up sensor on the HA100, and on-change: costs almost nothing idle.
+            proximity = sensors.getDefaultSensor(Sensor.TYPE_PROXIMITY, true)
+                ?: sensors.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+            val p = proximity
+            if (p == null) {
+                Log.w(TAG, "no proximity sensor")
+            } else {
+                sensors.registerListener(this, p, SensorManager.SENSOR_DELAY_NORMAL)
+                Log.i(TAG, "proximity wake on: ${p.name}, wakeUp=${p.isWakeUpSensor}, range=${p.maximumRange}")
+            }
+        } else if (!want && proximity != null) {
+            sensors.unregisterListener(this)
+            proximity = null
+            Log.i(TAG, "proximity wake off")
+        }
+    }
+
+    override fun onSensorChanged(e: SensorEvent) {
+        val near = e.values[0] < (proximity?.maximumRange ?: 5f)
+        val at = clock.format(Date())
+        val interactive = power.isInteractive
+        Log.i(TAG, "proximity ${if (near) "NEAR" else "FAR"} (${e.values[0]}) screen=${if (interactive) "on" else "off"}")
+        HostState.proximity(near, at)
+        val now = SystemClock.elapsedRealtime()
+        if (!interactive && now - lastProximityWake > PROXIMITY_WAKE_GAP_MS) {
+            lastProximityWake = now
+            Log.i(TAG, "proximity wake")
+            wakeScreen(1_000)
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    // ---------- helpers ----------
+
+    /** Lights the screen; after [holdMs] the normal screen timeout takes over again. */
     @Suppress("DEPRECATION") // still the simplest way to light the screen from a service on Android 8.1
     private fun wakeScreen(holdMs: Long) {
         power.newWakeLock(
             PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
             "harmoniumhost:wake"
         ).acquire(holdMs)
-    }
-
-    private fun broadcast(action: String) {
-        val level = (getSystemService(BATTERY_SERVICE) as BatteryManager)
-            .getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-        sendBroadcast(Intent(action).setPackage(packageName).putExtra(EXTRA_LEVEL, level))
     }
 
     private fun notification(): Notification {

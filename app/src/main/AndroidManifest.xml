@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Merge into the manifest Android Studio generated (keep its icon / roundIcon lines). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -8,10 +7,15 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Optional: lets Settings change Android's screen timeout. Granted by the user in Settings. -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
 
     <!-- usesCleartextTraffic: HA is plain http on the LAN. Without it, targetSdk 28+ blocks http:// and ws://. -->
     <application
+        android:name=".HostApp"
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Harmonium Host"
         android:theme="@style/Theme.HarmoniumHost"
         android:usesCleartextTraffic="true">
@@ -34,6 +38,18 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             -->
+        </activity>
+
+        <!-- Also in the app drawer as "Harmonium settings", so it's reachable without adb. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="Harmonium settings"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
         </activity>
 
         <service
