@@ -1,3 +1,6 @@
+# OPTIONAL: only needed if you turn on "Siri routing" in the remote's settings.
+# By default every utterance goes to Assist, and none of this is needed.
+#
 # /config/packages/remote_voice.yaml
 # Needs, in configuration.yaml:
 #   homeassistant:
@@ -5,9 +8,10 @@
 #
 # One input_boolean per remote. The app reads it the moment you press the mic key:
 #   on  -> Siri on that room's Apple TV (appletv_siri, ?route=siri)
-#   off -> your default Assist pipeline
+#   off -> the Assist pipeline set in the remote's settings
 # The automation keeps it in sync with the room's Harmonium activity; you can still flip it by hand.
-# Copy both blocks per room, and replace the activity names with your real Apple TV activities.
+# Copy both blocks per room. Harmonium's activity select uses activity ids as its options
+# ("off" when idle), so replace the placeholder id with your Apple TV activity's id.
 
 input_boolean:
   remote_siri_great_room:
@@ -25,7 +29,7 @@ automation:
     actions:
       - action: >-
           {{ 'input_boolean.turn_on'
-             if trigger.to_state.state in ['Watch Apple TV']
+             if trigger.to_state.state in ['watch_apple_tv']
              else 'input_boolean.turn_off' }}
         target:
           entity_id: input_boolean.remote_siri_great_room
