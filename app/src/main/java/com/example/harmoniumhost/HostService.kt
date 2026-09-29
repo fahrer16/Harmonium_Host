@@ -29,19 +29,22 @@ import java.util.Locale
  *  - on the cradle: wake briefly so the charging screen is seen
  *  - off the cradle: wake immediately (you're about to use it)
  *  - proximity (the device's only wake-up sensor): wake when a hand comes near
- *  - while the screen is on: HA link up (activity state) and Wi-Fi out of power save
+ *  - the ESPHome API server, so HA sees the remote as a voice satellite with battery entities
+ *  - while the screen is on: Wi-Fi out of power save
  */
 class HostService : Service(), SensorEventListener {
 
     companion object {
         /** Sent by Settings after a save. */
         const val ACTION_RELOAD = "com.example.harmoniumhost.RELOAD"
+        private const val EXTRA_ESP_CHANGED = "esp_changed"
         private const val TAG = "HarmoniumHost"
         private const val CHANNEL = "host"
         private const val PROXIMITY_WAKE_GAP_MS = 3_000L
 
-        fun reload(context: Context) = ContextCompat.startForegroundService(
-            context, Intent(context, HostService::class.java).setAction(ACTION_RELOAD))
+        fun reload(context: Context, espChanged: Boolean = false) = ContextCompat.startForegroundService(
+            context, Intent(context, HostService::class.java).setAction(ACTION_RELOAD)
+                .putExtra(EXTRA_ESP_CHANGED, espChanged))
     }
 
     private lateinit var app: HostApp
@@ -69,10 +72,9 @@ class HostService : Service(), SensorEventListener {
                     val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
                     val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
                     val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
-                    HostState.setBattery(
-                        if (level >= 0 && scale > 0) level * 100 / scale else -1,
-                        plugged,
-                        plugged && status == BatteryManager.BATTERY_STATUS_FULL)
+                    val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
+                    HostState.setBattery(pct, plugged, plugged && status == BatteryManager.BATTERY_STATUS_FULL)
+                    app.esp.publishBattery(pct, plugged)
                 }
                 Intent.ACTION_SCREEN_ON -> screen(true)
                 Intent.ACTION_SCREEN_OFF -> screen(false)
@@ -87,7 +89,8 @@ class HostService : Service(), SensorEventListener {
         sensors = getSystemService(SENSOR_SERVICE) as SensorManager
         startForeground(1, notification())
 
-        app.watcher   // create it so it hears the link come up
+        Log.i(TAG, "Harmonium Host ${app.versionName} service starting")
+        app.esp.start()
         val sticky = ContextCompat.registerReceiver(this, events, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_POWER_DISCONNECTED)
@@ -111,7 +114,7 @@ class HostService : Service(), SensorEventListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_RELOAD) {
             applySettings()
-            app.link.restart()
+            if (intent.getBooleanExtra(EXTRA_ESP_CHANGED, false)) app.esp.reload()
         }
         return START_STICKY
     }
@@ -122,12 +125,12 @@ class HostService : Service(), SensorEventListener {
         unregisterReceiver(events)
         sensors.unregisterListener(this)
         wifiLock?.release()
-        app.link.want("screen", false)
+        app.esp.stop()
         super.onDestroy()
     }
 
     private fun screen(on: Boolean) {
-        app.link.want("screen", on)
+        Log.i(TAG, "screen ${if (on) "on" else "off"}")
         if (on) {
             wifiLock?.acquire()
             HostState.fire(HostState.Event.SCREEN_ON)
