@@ -28,7 +28,11 @@ object HostState {
         private set
     var batteryLevel = -1
         private set
+    /** Home Assistant is connected to this remote's ESPHome API. */
     var haConnected = false
+        private set
+    /** HA has subscribed to the voice assistant, so push-to-talk can run. */
+    var voiceReady = false
         private set
     var lastProximity = ""
         private set
@@ -65,6 +69,10 @@ object HostState {
 
     fun setHaConnected(connected: Boolean) = onMain {
         if (connected != haConnected) { haConnected = connected; changed() }
+    }
+
+    fun setVoiceReady(ready: Boolean) = onMain {
+        if (ready != voiceReady) { voiceReady = ready; changed() }
     }
 
     fun proximity(near: Boolean, at: String) = onMain {

@@ -7,6 +7,7 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
@@ -28,11 +29,6 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import org.json.JSONObject
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -50,10 +46,8 @@ class SettingsActivity : AppCompatActivity() {
     private val savers = ArrayList<(SharedPreferences.Editor) -> Unit>()
 
     private lateinit var urlField: EditText
+    private lateinit var pathField: EditText
     private lateinit var tokenField: EditText
-    private lateinit var roomField: EditText
-    private lateinit var entityField: EditText
-    private lateinit var pipelineField: EditText
     private lateinit var rulesField: EditText
     private lateinit var timeoutField: EditText
     private lateinit var micLabel: TextView
@@ -76,47 +70,48 @@ class SettingsActivity : AppCompatActivity() {
         }
         setContentView(ScrollView(this).apply { addView(list, MATCH_PARENT, WRAP_CONTENT) })
 
-        heading("Harmonium Host", 22f)
+        heading("Harmonium Host ${app.versionName}", 22f)
         buttons("Save" to ::save, "Test connection" to ::test, "Close" to ::finish)
+        buttons("Android settings" to { startActivity(Intent(Settings.ACTION_SETTINGS)) },
+            "Wi-Fi" to { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) })
 
-        heading("Home Assistant")
-        urlField = text("ha_url", "Home Assistant URL", prefs.haUrl, InputType.TYPE_TEXT_VARIATION_URI)
-        tokenField = field("Long-lived access token",
-            if (prefs.token.isEmpty()) "not set (see note below)" else "saved (type here to replace)",
-            "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
-        note("Easiest: leave this blank and pair the remote in Harmonium (Studio → approve); " +
-            "this app then uses Harmonium's token. Or paste one over adb: see README.")
-        buttons("Forget token" to {
-            prefs.token = ""
-            prefs.harmoniumProvisioned = true
-            tokenField.hint = "not set"
-            toast("Token cleared. Harmonium's token will be picked up if it has one.")
-        })
-        roomField = text("room", "Room id (as in select.harmonium_<room>_activity)", prefs.room)
+        heading("Status")
+        statusText = label("")
 
         heading("Harmonium")
-        text("harmonium_path", "Page path", prefs.harmoniumPath)
-        text("harmonium_profile", "Remote profile (astrion, astrion2, …)", prefs.harmoniumProfile)
-        entityField = text("activity_entity", "Activity entity", prefs.rawString("activity_entity") ?: "",
+        urlField = text("ha_url", "Home Assistant URL (use the IP address)", prefs.haUrl,
+            InputType.TYPE_TEXT_VARIATION_URI)
+        pathField = text("harmonium_path", "Harmonium page path", prefs.harmoniumPath)
+        choice("harmonium_profile", "Remote profile (Harmonium's remotes.<id>)",
+            listOf("astrion" to "astrion", "astrion2" to "astrion2 (transport keys)",
+                "none" to "none (Harmonium decides)"),
+            prefs.rawString("harmonium_profile") ?: "astrion")
+        text("start_page", "Start page (Harmonium page id, e.g. great_room)",
+            prefs.rawString("start_page") ?: "", hint = "blank = Harmonium's home")
+        text("room", "Room id (as in select.harmonium_<room>_activity)", prefs.room)
+        text("activity_entity", "Activity entity", prefs.rawString("activity_entity") ?: "",
             hint = "select.harmonium_<room>_activity")
         text("idle_states", "States that mean \"no activity\" (comma separated)",
             prefs.rawString("idle_states") ?: "off")
+        tokenField = field("Token for Harmonium (optional)",
+            if (prefs.token.isEmpty()) "not set: Harmonium's own pairing is fine" else "saved (type here to replace)",
+            "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
 
-        heading("Voice (hold the mic button and speak)")
+        heading("Voice assistant (Home Assistant device)")
+        note("This remote is an ESPHome device. In Home Assistant: Settings → Devices & services. " +
+            "Accept the discovered \"${prefs.espFriendlyName}\", or Add integration → ESPHome → " +
+            "host ${ipAddress() ?: "<this remote's IP>"}, port ${EspServer.PORT}. Then open the device " +
+            "to set its area and its Assistant (pipeline). Hold the mic button and speak.")
+        text("esp_name", "Device name (a-z, 0-9, -)", prefs.rawString("esp_name") ?: "",
+            hint = prefs.espName)
+        text("esp_friendly_name", "Friendly name", prefs.rawString("esp_friendly_name") ?: "",
+            hint = prefs.espFriendlyName)
         micLabel = label("")
         showMic()
         buttons("Learn mic button" to {
             learningMic = true
             micLabel.text = "Press the mic button now…"
         })
-        pipelineField = text("pipeline", "Assist pipeline id", prefs.rawString("pipeline") ?: "",
-            hint = "blank = HA's preferred pipeline")
-        note("\"Test connection\" lists your pipelines and lets you pick one.")
-        toggle("siri_enabled", "Siri routing (appletv_siri): use Siri when the entity below is on",
-            prefs.siriEnabled)
-        text("siri_entity", "Siri switch entity", prefs.rawString("siri_entity") ?: "",
-            hint = "input_boolean.remote_siri_<room>")
-        text("apple_tv", "Apple TV id (appletv_siri)", prefs.rawString("apple_tv") ?: "", hint = "<room>")
 
         heading("Screen and wake")
         choice("keep_awake", "Keep the screen on (dimmed) so the first press always works",
@@ -156,8 +151,7 @@ class SettingsActivity : AppCompatActivity() {
         buttons("Restore default keys" to { rulesField.setText(HostPrefs.DEFAULT_KEY_RULES) })
         number("long_press_ms", "Long press (ms)", prefs.longPressMs)
 
-        heading("Status")
-        statusText = label("")
+        heading("More")
         buttons("Reload Harmonium" to {
             prefs.reloadPending = true
             finish()
@@ -203,124 +197,47 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun commit() {
         val before = harmoniumInputs()
+        val espBefore = espInputs()
         prefs.edit {
             savers.forEach { it(this) }
-            tokenField.text.toString().trim().takeIf { it.isNotEmpty() }?.let { putString("token", it) }
+            tokenField.text.toString().trim().takeIf { it.isNotEmpty() }?.let {
+                putString("token", it)
+                putBoolean("harmonium_provisioned", false)    // hand it to Harmonium on the next load
+            }
             putInt("mic_keycode", micCode).putInt("mic_scancode", micScan)
             putBoolean("setup_done", true)
         }
-
-        val after = harmoniumInputs()
-        if (after != before) {
-            // hand the new host/token/profile to Harmonium, then reload it
-            if (after.take(3) != before.take(3)) prefs.harmoniumProvisioned = false
+        if (harmoniumInputs() != before) {
+            if (harmoniumInputs()[0] != before[0]) prefs.harmoniumProvisioned = false   // new host
             prefs.reloadPending = true
         }
         setSystemTimeout()
-        HostService.reload(this)
+        HostService.reload(this, espChanged = espInputs() != espBefore)
         toast("Saved")
         finish()
     }
 
-    private fun harmoniumInputs() = listOf(prefs.haUrl, prefs.token, prefs.harmoniumProfile, prefs.harmoniumPath)
+    private fun harmoniumInputs() =
+        listOf(prefs.haUrl, prefs.harmoniumProfile, prefs.harmoniumPath, prefs.startPage, prefs.token)
+    private fun espInputs() = listOf(prefs.espName, prefs.espFriendlyName, prefs.activityEntity)
 
-    /** Checks the URL, token, activity entity and Assist pipelines using the values typed so far. */
+    /** Checks that the Harmonium page loads from the URL typed so far. */
     private fun test() {
-        val url = urlField.text.toString().trim().trimEnd('/').ifEmpty { prefs.haUrl }
-        val token = tokenField.text.toString().trim().ifEmpty { prefs.token }
-        val room = roomField.text.toString().trim().ifEmpty { prefs.room }
-        val entity = entityField.text.toString().trim().ifEmpty { "select.harmonium_${room}_activity" }
-        statusText.text = "Testing…"
+        val url = urlField.text.toString().trim().trimEnd('/').ifEmpty { prefs.haUrl } +
+            pathField.text.toString().trim().ifEmpty { prefs.harmoniumPath }
+        statusText.text = "Testing $url …"
         thread(name = "settings-test") {
-            val lines = ArrayList<String>()
-            var pipelines: List<Pair<String, String>> = emptyList()
-            try {
-                if (token.isEmpty()) {
-                    lines += "✗ No token. Pair Harmonium or paste one."
-                } else {
-                    get(url, token, "/api/").use { r ->
-                        lines += when (r.code) {
-                            200 -> "✓ Home Assistant reachable, token accepted"
-                            401 -> "✗ Token rejected (401)"
-                            else -> "✗ /api/ returned ${r.code}"
-                        }
+            val line = try {
+                app.http.newBuilder().callTimeout(5, TimeUnit.SECONDS).build()
+                    .newCall(Request.Builder().url(url).build()).execute().use { r ->
+                        if (r.isSuccessful) "✓ Harmonium page loads ($url)"
+                        else "✗ $url returned ${r.code}. Check the URL and page path."
                     }
-                    get(url, token, "/api/states/$entity").use { r ->
-                        lines += if (r.isSuccessful) {
-                            "✓ $entity = ${JSONObject(r.body?.string().orEmpty()).optString("state")}"
-                        } else "✗ $entity not found (${r.code}). Check the room id / entity."
-                    }
-                    val found = listPipelines(url, token)
-                    pipelines = found.first
-                    lines += found.second
-                }
             } catch (ex: Exception) {
-                lines += "✗ ${ex.javaClass.simpleName}: ${ex.message}"
+                "✗ Can't reach $url: ${ex.message}"
             }
-            runOnUiThread {
-                statusText.text = lines.joinToString("\n") + "\n\n" + statusSummary()
-                if (pipelines.isNotEmpty()) pickPipeline(pipelines)
-            }
+            runOnUiThread { statusText.text = line + "\n\n" + statusSummary() }
         }
-    }
-
-    private fun get(url: String, token: String, path: String): Response =
-        app.http.newBuilder().callTimeout(5, TimeUnit.SECONDS).build().newCall(
-            Request.Builder().url(url + path).header("Authorization", "Bearer $token").build()
-        ).execute()
-
-    /** One-off websocket: assist_pipeline/pipeline/list. Returns (id to label) plus report lines. */
-    private fun listPipelines(url: String, token: String): Pair<List<Pair<String, String>>, List<String>> {
-        val done = CountDownLatch(1)
-        var reply: JSONObject? = null
-        val ws = app.http.newWebSocket(
-            Request.Builder().url(url.replaceFirst("http", "ws") + "/api/websocket").build(),
-            object : WebSocketListener() {
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    val msg = JSONObject(text)
-                    when (msg.optString("type")) {
-                        "auth_required" -> webSocket.send(
-                            JSONObject().put("type", "auth").put("access_token", token).toString())
-                        "auth_ok" -> webSocket.send(
-                            JSONObject().put("id", 1).put("type", "assist_pipeline/pipeline/list").toString())
-                        "result" -> { reply = msg; done.countDown() }
-                        "auth_invalid" -> done.countDown()
-                    }
-                }
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = done.countDown()
-            })
-        done.await(6, TimeUnit.SECONDS)
-        ws.close(1000, null)
-        val result = reply?.optJSONObject("result") ?: return emptyList<Pair<String, String>>() to
-            listOf("✗ Couldn't list Assist pipelines")
-        val preferred = result.optString("preferred_pipeline")
-        val arr = result.optJSONArray("pipelines")
-        val out = ArrayList<Pair<String, String>>()
-        val lines = ArrayList<String>()
-        for (i in 0 until (arr?.length() ?: 0)) {
-            val p = arr!!.getJSONObject(i)
-            val id = p.optString("id")
-            val stt = p.optString("stt_engine").takeIf { it.isNotEmpty() && it != "null" }
-            val tts = p.optString("tts_engine").takeIf { it.isNotEmpty() && it != "null" }
-            val name = p.optString("name") + (if (id == preferred) " (preferred)" else "")
-            out += id to name
-            lines += (if (stt != null) "✓ " else "✗ ") + "Pipeline $name: " +
-                (stt?.let { "speech-to-text $it" } ?: "NO speech-to-text, can't be used for voice") +
-                (tts?.let { ", voice reply $it" } ?: ", no voice reply")
-        }
-        if (out.isEmpty()) lines += "✗ No Assist pipelines. Create one in HA (Settings → Voice assistants)."
-        return out to lines
-    }
-
-    private fun pickPipeline(pipelines: List<Pair<String, String>>) {
-        val labels = (listOf("HA's preferred pipeline") + pipelines.map { it.second }).toTypedArray()
-        AlertDialog.Builder(this).setTitle("Assist pipeline for this remote")
-            .setItems(labels) { _, which ->
-                pipelineField.setText(if (which == 0) "" else pipelines[which - 1].first)
-                toast("Pipeline set; press Save")
-            }
-            .setNegativeButton("Keep as is", null)
-            .show()
     }
 
     private fun systemTimeoutSec(): Int? = try {
@@ -354,14 +271,25 @@ class SettingsActivity : AppCompatActivity() {
         val rules = KeyRemap.problems(prefs.keyRules)
         return listOf(
             "Battery: ${HostState.batteryLevel}%" + if (HostState.charging) ", charging" else "",
-            "HA link: " + if (HostState.haConnected) "connected" else "not connected",
-            "Token: " + if (prefs.token.isEmpty()) "none yet" else "set",
+            "Home Assistant (ESPHome): " + when {
+                HostState.voiceReady -> "connected, voice ready"
+                HostState.haConnected -> "connected, voice not subscribed yet"
+                else -> "not connected. Add the device in HA (see Voice assistant below)."
+            },
+            "This remote: ${ipAddress() ?: "no Wi-Fi address"}, port ${EspServer.PORT}, name ${prefs.espName}",
             "Activity (${prefs.activityEntity}): ${HostState.activity ?: "unknown"}" +
                 if (HostState.activityRunning) " → keeping screen on" else "",
             "Last proximity event: ${HostState.lastProximity.ifEmpty { "none yet" }}",
             "Microphone permission: " + if (mic) "granted" else "NOT granted",
             if (rules.isEmpty()) "Key rules: OK" else "Key rules: ${rules.size} problem(s)",
         ).joinToString("\n")
+    }
+
+    @Suppress("DEPRECATION") // WifiInfo.ipAddress is the simple way on API 27
+    private fun ipAddress(): String? {
+        val ip = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager).connectionInfo?.ipAddress ?: 0
+        if (ip == 0) return null
+        return "${ip and 0xFF}.${(ip shr 8) and 0xFF}.${(ip shr 16) and 0xFF}.${(ip shr 24) and 0xFF}"
     }
 
     // ---------- tiny view builders ----------

@@ -3,11 +3,12 @@ package com.example.harmoniumhost
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
-import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -29,7 +30,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import org.json.JSONTokener
 import kotlin.math.abs
 
 /**
@@ -42,6 +42,26 @@ class MainActivity : AppCompatActivity() {
         const val TAG = "HarmoniumHost"
         /** Hold the battery readout at the top this long to open Settings. */
         private const val SETTINGS_HOLD_MS = 3_000L
+
+        private const val NO_SIDEWAYS_SCROLL = """(function(){
+            if (document.getElementById('hh-noside')) return;
+            var s = document.createElement('style');
+            s.id = 'hh-noside';
+            s.textContent = 'html,body{overflow-x:hidden!important;overscroll-behavior-x:none!important}';
+            (document.head || document.documentElement).appendChild(s);
+        })()"""
+    }
+
+    /** Backstop for the CSS above: the page itself can never sit scrolled sideways. */
+    private class VerticalWebView(context: android.content.Context) : WebView(context) {
+        init {
+            overScrollMode = OVER_SCROLL_NEVER
+            isHorizontalScrollBarEnabled = false
+        }
+        override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+            super.onScrollChanged(l, t, oldl, oldt)
+            if (l != 0) scrollTo(0, t)
+        }
     }
 
     private lateinit var app: HostApp
@@ -51,14 +71,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusLine: TextView
     private lateinit var voiceOverlay: TextView
     private lateinit var charging: ChargingScreen
-    private lateinit var voice: VoiceRouter
+    private lateinit var voice: VoiceSatellite
     private lateinit var keeper: ScreenKeeper
     private val remap = KeyRemap { window.superDispatchKeyEvent(it) }
     private val hideVoiceOverlay = Runnable { voiceOverlay.visibility = View.GONE }
     private val openSettings = Runnable { startActivity(Intent(this, SettingsActivity::class.java)) }
     private var pressX = 0f
     private var pressY = 0f
-    private var lastAdoptTry = 0L
 
     private val hostListener = object : HostState.Listener {
         override fun onHostState() {
@@ -70,7 +89,6 @@ class MainActivity : AppCompatActivity() {
                 HostState.Event.SCREEN_ON -> {
                     keeper.interaction()
                     goImmersive()
-                    maybeAdoptHarmoniumToken()
                 }
                 // A hand coming near brightens a dimmed screen before the thumb lands.
                 HostState.Event.PROXIMITY -> keeper.interaction()
@@ -93,13 +111,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         app = HostApp.of(this)
         prefs = app.prefs
+        Log.i(TAG, "Harmonium Host ${app.versionName} starting")
         prefs.absorbProvisioning(intent)
         setShowWhenLocked(true)
         goImmersive()
         keeper = ScreenKeeper(window, prefs)
 
         val dp = resources.displayMetrics.density
-        webView = WebView(this)
+        webView = VerticalWebView(this)
         statusLine = TextView(this).apply {
             setTextColor(0xCCFFFFFF.toInt())
             setShadowLayer(2 * dp, 0f, 0f, Color.BLACK)   // legible on light and dark themes
@@ -131,6 +150,7 @@ class MainActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true                    // Harmonium keeps host/token in localStorage
             mediaPlaybackRequiresUserGesture = false
+            setSupportZoom(false)                       // no pinch zoom: the page is sized for the panel
         }
         webView.webViewClient = object : WebViewClient() {
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
@@ -139,7 +159,10 @@ class MainActivity : AppCompatActivity() {
                     view.postDelayed({ loadHarmonium() }, 5000)
                 }
             }
-            override fun onPageFinished(view: WebView, url: String) = maybeAdoptHarmoniumToken()
+            override fun onPageFinished(view: WebView, url: String) {
+                // Only vertical scrolling: stop the page from panning sideways under a swipe.
+                view.evaluateJavascript(NO_SIDEWAYS_SCROLL, null)
+            }
             // The MT6580 is short on memory; if the renderer is killed, start over instead of crashing.
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                 Log.w(TAG, "WebView renderer gone (crash=${detail.didCrash()}); recreating")
@@ -150,7 +173,7 @@ class MainActivity : AppCompatActivity() {
         loadHarmonium()
         webView.requestFocus()
 
-        voice = VoiceRouter(this, prefs, app.link, app.http) { text, done ->
+        voice = VoiceSatellite(this, prefs, app.esp) { text, done ->
             runOnUiThread { showVoiceOverlay(text, if (done) 2500L else 0L) }
         }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -171,13 +194,14 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         if (prefs.absorbProvisioning(intent)) {
             loadHarmonium()
-            HostService.reload(this)
+            HostService.reload(this, espChanged = true)
         }
     }
 
     override fun onResume() {
         super.onResume()
         goImmersive()
+        readBattery()
         applySettings()
         if (prefs.reloadPending) {
             prefs.reloadPending = false
@@ -277,36 +301,35 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Harmonium ----------
 
+    /**
+     * Loads Harmonium with its URL-fragment parameters (it reads them, stores what it keeps, and
+     * clears the fragment): `device` = the remote profile (astrion/astrion2) and `page` = the start
+     * page, on every load; `host`/`token` only once after they change (Harmonium's own pairing
+     * works too).
+     */
     private fun loadHarmonium() {
-        val base = prefs.haUrl + prefs.harmoniumPath
-        val url = if (!prefs.harmoniumProvisioned && prefs.token.isNotEmpty()) {
+        val params = ArrayList<String>()
+        if (!prefs.harmoniumProvisioned && prefs.token.isNotEmpty()) {
             prefs.harmoniumProvisioned = true
-            // Harmonium's own one-time provisioning: it stores these and strips them from the URL.
-            "$base#host=${Uri.encode(Uri.parse(prefs.haUrl).authority)}&token=${Uri.encode(prefs.token)}" +
-                "&device=${Uri.encode(prefs.harmoniumProfile)}"
-        } else base
+            params += "host=" + Uri.encode(Uri.parse(prefs.haUrl).authority)
+            params += "token=" + Uri.encode(prefs.token)
+        }
+        prefs.harmoniumProfile.takeIf { it.isNotEmpty() }?.let { params += "device=" + Uri.encode(it) }
+        prefs.startPage.takeIf { it.isNotEmpty() }?.let { params += "page=" + Uri.encode(it) }
+        val base = prefs.haUrl + prefs.harmoniumPath
+        val url = if (params.isEmpty()) base else base + "#" + params.joinToString("&")
+        Log.i(TAG, "loading Harmonium: $base (device=${prefs.harmoniumProfile}, page=${prefs.startPage})")
         webView.loadUrl(url)
     }
 
-    /**
-     * No token of our own yet, but Harmonium may have one (its pairing flow stores it in
-     * localStorage). Borrow it so voice and keep-awake work without typing a token on the remote.
-     */
-    private fun maybeAdoptHarmoniumToken() {
-        if (prefs.token.isNotEmpty()) return
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastAdoptTry < 10_000) return
-        lastAdoptTry = now
-        webView.evaluateJavascript(
-            "(function(){try{return localStorage.getItem('hakr_token')||''}catch(e){return ''}})()") { v ->
-            val token = try { JSONTokener(v).nextValue() as? String } catch (e: Exception) { null }
-            if (!token.isNullOrBlank() && prefs.token.isEmpty()) {
-                Log.i(TAG, "using Harmonium's paired HA token")
-                prefs.token = token.trim()
-                prefs.harmoniumProvisioned = true
-                app.link.restart()
-            }
-        }
+    /** Reads the sticky battery state directly, so the readout shows even before the service reports. */
+    private fun readBattery() {
+        val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
+        val level = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        val plugged = b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+        val full = plugged && b.getIntExtra(BatteryManager.EXTRA_STATUS, -1) == BatteryManager.BATTERY_STATUS_FULL
+        if (level >= 0 && scale > 0) HostState.setBattery(level * 100 / scale, plugged, full)
     }
 
     // ---------- overlays ----------

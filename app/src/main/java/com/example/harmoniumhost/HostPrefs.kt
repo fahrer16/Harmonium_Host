@@ -4,17 +4,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.view.KeyEvent
+import java.util.Random
 
 /**
  * Per-remote settings, edited in SettingsActivity and saved on the remote. Nothing here needs a
  * rebuild: the defaults below only apply until a value is saved.
  *
- * adb provisioning still works (handy for pasting a long token):
+ * adb provisioning still works for the string keys in [ADB_KEYS], e.g.
  *
- *   adb shell am start -n com.example.harmoniumhost/.MainActivity \
- *     --es token "<long-lived token>" --es room great_room
- *
- * Any subset of the string keys in [ADB_KEYS] can be sent later to change just those.
+ *   adb shell am start -n com.example.harmoniumhost/.MainActivity --es room great_room
  */
 class HostPrefs(context: Context) {
 
@@ -44,8 +42,8 @@ class HostPrefs(context: Context) {
         """.trimIndent()
 
         private val ADB_KEYS = listOf(
-            "ha_url", "token", "room", "harmonium_path", "harmonium_profile",
-            "activity_entity", "pipeline", "apple_tv", "siri_entity",
+            "ha_url", "token", "room", "harmonium_path", "harmonium_profile", "start_page",
+            "activity_entity", "esp_name", "esp_friendly_name",
         )
     }
 
@@ -62,16 +60,17 @@ class HostPrefs(context: Context) {
 
     // ---- Home Assistant ----
     val haUrl get() = str("ha_url", "http://192.168.100.10:8123").trimEnd('/')
-    var token: String
-        get() = str("token")
-        set(v) = edit { putString("token", v) }
+    /** Optional: handed to Harmonium once (its own pairing works too). Not used by the native side. */
+    val token get() = str("token")
     val room get() = str("room", "great_room")
 
     // ---- Harmonium ----
     /** Same path Fully Kiosk loads today, without the host. */
     val harmoniumPath get() = str("harmonium_path", "/local/harmonium/main/index.html")
-    /** Harmonium remote profile (config.json `remotes.<id>`), handed over as `#device=`. */
-    val harmoniumProfile get() = str("harmonium_profile", "astrion")
+    /** Harmonium remote profile (config.json `remotes.<id>`), passed as `#device=` on every load. */
+    val harmoniumProfile get() = str("harmonium_profile", "astrion").let { if (it == "none") "" else it }
+    /** Harmonium page id to open on every load (`#page=`). Blank = Harmonium's home. */
+    val startPage get() = str("start_page")
     var harmoniumProvisioned: Boolean
         get() = bool("harmonium_provisioned", false)
         set(v) = edit { putBoolean("harmonium_provisioned", v) }
@@ -87,17 +86,24 @@ class HostPrefs(context: Context) {
         get() = (str("idle_states", "off").split(',') + listOf("unknown", "unavailable"))
             .map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
 
+    // ---- Home Assistant device (ESPHome native API) ----
+    /** ESPHome node name: lowercase letters, digits and dashes, at most 31 characters. */
+    val espName: String
+        get() = str("esp_name", "harmonium-remote-$room").lowercase()
+            .replace(Regex("[^a-z0-9-]"), "-").take(31)
+    val espFriendlyName get() = str("esp_friendly_name",
+        "Harmonium Remote " + room.split('_', '-').joinToString(" ") { w -> w.replaceFirstChar { it.uppercase() } })
+    /** A made-up, stable MAC: HA identifies ESPHome devices by it (apps can't read the real one). */
+    val espMac: String
+        get() = sp.getString("esp_mac", null) ?: run {
+            val b = ByteArray(6).also { Random().nextBytes(it) }
+            b[0] = ((b[0].toInt() and 0xFC) or 0x02).toByte()   // locally administered, unicast
+            b.joinToString(":") { "%02X".format(it) }.also { mac -> edit { putString("esp_mac", mac) } }
+        }
+
     // ---- Voice ----
     val micKeyCode get() = int("mic_keycode", KeyEvent.KEYCODE_F3)
     val micScanCode get() = int("mic_scancode", -1)
-    /** Assist pipeline id. Blank = HA's preferred pipeline. */
-    val pipelineId get() = str("pipeline")
-    /** Off (default): every utterance goes to Assist. On: [siriEntity] decides per utterance. */
-    val siriEnabled get() = bool("siri_enabled", false)
-    /** Name or identifier from the Apple TV's "Voice Url" sensor: /api/appletv_siri/audio/<this> */
-    val appleTv get() = str("apple_tv", room)
-    /** The "bit" HA flips to send this remote's voice to Siri. */
-    val siriEntity get() = str("siri_entity", "input_boolean.remote_siri_$room")
 
     // ---- Screen and wake ----
     val keepAwake get() = str("keep_awake", KEEP_ACTIVITY)
@@ -130,8 +136,7 @@ class HostPrefs(context: Context) {
         val edit = sp.edit()
         var changed = false
         for (k in ADB_KEYS) extras.getString(k)?.let { edit.putString(k, it); changed = true }
-        if (extras.containsKey("token") || extras.containsKey("ha_url") ||
-            extras.containsKey("harmonium_profile")) {
+        if (extras.containsKey("token") || extras.containsKey("ha_url")) {
             edit.putBoolean("harmonium_provisioned", false)   // re-hand credentials to Harmonium
         }
         if (changed) edit.putBoolean("setup_done", true)
