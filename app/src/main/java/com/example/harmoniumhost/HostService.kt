@@ -149,7 +149,12 @@ class HostService : Service() {
         }, ContextCompat.RECEIVER_NOT_EXPORTED)
         // BATTERY_CHANGED is sticky: the current state comes back from registerReceiver.
         sticky?.let { events.onReceive(this, it) }
-        (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(network)
+        // Only feeds the "network uptime" diagnostic, so a failure here must never stop the service.
+        try {
+            (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(network)
+        } catch (e: Exception) {
+            Log.w(TAG, "network callback not registered: $e")
+        }
 
         // High-perf only while the screen is on (keys land fast); normal power save while it's off.
         @Suppress("DEPRECATION")
