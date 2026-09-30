@@ -12,7 +12,7 @@ import java.util.Random
  *
  * adb provisioning still works for the string keys in [ADB_KEYS], e.g.
  *
- *   adb shell am start -n com.example.harmoniumhost/.MainActivity --es room great_room
+ *   adb shell am start -n io.github.fahrer16.harmoniumhost/com.example.harmoniumhost.MainActivity --es room great_room
  */
 class HostPrefs(context: Context) {
 

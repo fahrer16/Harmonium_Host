@@ -84,14 +84,19 @@ First field report: no proximity events when lifting the remote, yet the screen 
 6. Done in 0.5: the app can be the HOME app (asks once). Verify it replaces Fully Kiosk / the stock launcher after a reboot.
 7. Maybe: announce support (HA speaks on the remote), a keep-awake switch, Noise encryption.
 
+## Releases
+- 1.0.0 is the first public release. applicationId is `io.github.fahrer16.harmoniumhost` since 1.0.0 (dev builds up to 0.6 were `com.example.harmoniumhost`); the Kotlin package/namespace stays `com.example.harmoniumhost`, so adb component names are `io.github.fahrer16.harmoniumhost/com.example.harmoniumhost.MainActivity`.
+- `.github/workflows/android.yml`: debug APK on every PR and push to main (a real Gradle build, which the sandbox can't do); a `v*` tag builds the release APK signed from repository secrets (`RELEASE_KEYSTORE_BASE64`, `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS`, `RELEASE_KEY_PASSWORD`; decoded to a temp file, read by `app/build.gradle.kts` through env vars) and publishes a GitHub release with `docs/releases/<tag>.md` as the notes. The same key must sign every release. JDK 25 (the Gradle daemon toolchain).
+- To release: bump versionCode/versionName, add `docs/releases/vX.Y.Z.md`, merge, tag the merge commit.
+
 ## Dev workflow
 ```bash
 export PATH="$HOME/Library/Android/sdk/platform-tools:$PATH"
 adb connect <remote-ip>:5555                      # after `adb tcpip 5555` over USB once per reboot
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.example.harmoniumhost/.MainActivity --es room great_room --es start_page great_room
-adb shell am start -n com.example.harmoniumhost/.SettingsActivity   # or swipe down / hold at the top edge
-adb shell am dumpheap com.example.harmoniumhost /data/local/tmp/hh.hprof && adb pull /data/local/tmp/hh.hprof   # heap dump, open in Android Studio
+adb shell am start -n io.github.fahrer16.harmoniumhost/com.example.harmoniumhost.MainActivity --es room great_room --es start_page great_room
+adb shell am start -n io.github.fahrer16.harmoniumhost/com.example.harmoniumhost.SettingsActivity   # or the pull-down panel → Settings
+adb shell am dumpheap io.github.fahrer16.harmoniumhost /data/local/tmp/hh.hprof && adb pull /data/local/tmp/hh.hprof   # heap dump, open in Android Studio
 adb logcat -s HarmoniumHost
 ```

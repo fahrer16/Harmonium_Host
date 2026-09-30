@@ -40,7 +40,7 @@ import com.example.harmoniumhost.HarmoniumStyle as S
 /**
  * Every setting the remote needs, saved on the remote (SharedPreferences via [HostPrefs]).
  * Open it from the pull-down panel (pull down from the top edge, or hold a finger there; then
- * Settings), from Home Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
+ * Settings), from Home Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n io.github.fahrer16.harmoniumhost/com.example.harmoniumhost.SettingsActivity`.
  * Styled like Harmonium (see [HarmoniumStyle]); every control is D-pad reachable and shows the
  * amber focus ring. Plain views built in code: nothing to inflate, and fields are one line each.
  */
