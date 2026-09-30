@@ -12,7 +12,8 @@ import android.view.WindowManager
  *
  * Why: Android spends the key that wakes a sleeping screen on waking it; the app never sees that
  * press. A dim screen is still "interactive", so every key reaches Harmonium. Rules:
- *  - hold the screen on while [HostPrefs.keepAwake] says so (default: an activity is running)
+ *  - hold the screen on while [HostPrefs.keepAwake] says so (default: only on the cradle; off it,
+ *    the screen times out and the firmware's lift-wake turns it back on)
  *  - dim to [HostPrefs.dimLevelPct] after [HostPrefs.dimAfterSec] without a press
  *  - give up after [HostPrefs.awakeLimitMin] without a press (not on the cradle, by default),
  *    then Android's own screen timeout turns it off
@@ -44,6 +45,7 @@ class ScreenKeeper(
         val idle = SystemClock.elapsedRealtime() - lastInteraction
         val wanted = when (prefs.keepAwake) {
             HostPrefs.KEEP_ALWAYS -> true
+            HostPrefs.KEEP_CRADLE -> HostState.charging
             HostPrefs.KEEP_ACTIVITY -> HostState.activityRunning
             else -> false
         }

@@ -41,12 +41,20 @@ class EspSwitch(
 class EspNumber(
     key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
     val min: Float, val max: Float, val step: Float, val unit: String = "",
+    /** HA's NumberMode: 1 = box (type a value), 2 = slider. */
+    val mode: Int = 2,
     val read: () -> Float?, val write: (Float) -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
 
 class EspSelect(
     key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
     val options: List<String>, val read: () -> String?, val write: (String) -> Unit,
+) : EspEntity(key, objectId, name, icon, category)
+
+/** Editable text (HA's text entity). Used for settings; HA caps text states at 255 characters. */
+class EspText(
+    key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
+    val maxLength: Int = 255, val read: () -> String?, val write: (String) -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
 
 class EspButton(

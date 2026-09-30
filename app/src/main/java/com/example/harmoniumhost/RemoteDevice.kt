@@ -10,6 +10,7 @@ import android.app.usage.UsageStatsManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.media.AudioManager
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -34,7 +35,7 @@ class ScreenOffAdmin : DeviceAdminReceiver()
 
 /**
  * Everything this remote exposes to Home Assistant besides the voice satellite: controls, the
- * screenshot camera, and diagnostics. Keys are stable ids; don't renumber them (HA keys its
+ * screenshot camera, the remote's settings (the same values as its Settings screen), and diagnostics. Keys are stable ids; don't renumber them (HA keys its
  * entities by object_id, but the key has to stay consistent within a connection).
  */
 class RemoteDevice(private val context: Context, private val esp: EspServer) {
@@ -68,9 +69,8 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
         EspSwitch(11, "screensaver", "Screensaver", "mdi:image-filter-hdr",
             read = { HostState.screensaverOn },
             write = { on -> HostState.fire(if (on) HostState.Event.SCREENSAVER_ON else HostState.Event.SCREENSAVER_OFF) }),
-        EspSelect(12, "screensaver_mode", "Screensaver mode", "mdi:palette", EspEntity.CAT_CONFIG,
-            options = HostPrefs.SCREENSAVER_MODES, read = { prefs.screensaverMode },
-            write = { mode -> if (mode in HostPrefs.SCREENSAVER_MODES) prefs.edit { putString("screensaver_mode", mode) } }),
+        settingSelect(12, "screensaver_mode", "screensaver_mode", "Screensaver mode", "mdi:palette",
+            HostPrefs.SCREENSAVER_MODES) { prefs.screensaverMode },
         EspSwitch(13, "adaptive_brightness", "Adaptive brightness", "mdi:brightness-auto", EspEntity.CAT_CONFIG,
             read = { systemInt(Settings.System.SCREEN_BRIGHTNESS_MODE)?.let { it == Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC } },
             write = { on -> putSystemInt(Settings.System.SCREEN_BRIGHTNESS_MODE,
@@ -95,13 +95,14 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
             press = { HostState.fire(HostState.Event.CLEAR_CACHE) }),
         EspButton(23, "restart_app", "Restart app", "mdi:restart", EspEntity.CAT_CONFIG, press = { restartApp() }),
         EspButton(24, "take_screenshot", "Take screenshot", "mdi:camera", press = { esp.pushImage(screenshotCamera) }),
+        EspButton(25, "open_settings", "Open settings on the remote", "mdi:cog", EspEntity.CAT_CONFIG,
+            press = { main.post { openSettings() } }),
         screenshotCamera,
 
         // ---- sensors ----
         EspSensor(40, "battery", "Battery", unit = "%", deviceClass = "battery",
             read = { HostState.batteryLevel.takeIf { it >= 0 }?.toFloat() }),
         EspBinarySensor(41, "charging", "Charging", deviceClass = "battery_charging", read = { HostState.charging }),
-        EspSensor(42, "light", "Ambient light", unit = "lx", deviceClass = "illuminance", read = { HostState.lux }),
         EspTextSensor(43, "last_interaction", "Last interaction", "mdi:gesture-tap", deviceClass = "timestamp",
             read = { iso(HostState.lastInteractionAt) }),
         EspBinarySensor(44, "activity_running", "Activity running", "mdi:remote-tv", read = { HostState.activityRunning }),
@@ -126,8 +127,6 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
         EspSensor(69, "storage_total", "Internal storage total", "mdi:harddisk", EspEntity.CAT_DIAGNOSTIC,
             unit = "GB", deviceClass = "data_size", decimals = 2, read = { storage().second }),
         EspTextSensor(70, "ip", "IPv4 address", "mdi:ip-network", EspEntity.CAT_DIAGNOSTIC, read = { ipAddress() }),
-        EspTextSensor(71, "last_seen", "Last seen", "mdi:clock-check-outline", EspEntity.CAT_DIAGNOSTIC,
-            deviceClass = "timestamp", read = { iso(System.currentTimeMillis()) }),
         EspSensor(72, "network_uptime", "Network uptime", "mdi:wifi", EspEntity.CAT_DIAGNOSTIC,
             unit = "s", deviceClass = "duration", read = { (SystemClock.elapsedRealtime() - networkUpSince) / 1000f }),
         EspSensor(73, "ram_available", "RAM available", "mdi:memory", EspEntity.CAT_DIAGNOSTIC,
@@ -136,6 +135,51 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
             unit = "MB", deviceClass = "data_size", read = { memory().totalMem / MB }),
         EspSensor(75, "wifi_signal", "Wi-Fi signal", category = EspEntity.CAT_DIAGNOSTIC,
             unit = "dBm", deviceClass = "signal_strength", read = { wifi.connectionInfo?.rssi?.toFloat() }),
+
+        // ---- settings: the Settings screen's values, editable from HA (not the token, device names or key rules) ----
+        EspText(80, "ha_url", "Home Assistant URL", "mdi:home-assistant", EspEntity.CAT_CONFIG,
+            read = { prefs.haUrl },
+            write = { v -> saveSetting(reloadsPage = true) {
+                putOrRemove("ha_url", v)
+                putBoolean("harmonium_provisioned", false)       // hand host/token to Harmonium again
+            } }),
+        settingText(81, "harmonium_path", "harmonium_path", "Harmonium page path", "mdi:file-link",
+            reloadsPage = true) { prefs.harmoniumPath },
+        settingSelect(82, "harmonium_profile", "harmonium_profile", "Remote profile", "mdi:remote",
+            listOf("astrion", "astrion2", "none"), reloadsPage = true) { prefs.harmoniumProfile.ifEmpty { "none" } },
+        settingText(83, "start_page", "start_page", "Start page", "mdi:home-outline",
+            reloadsPage = true) { prefs.startPage },
+        settingText(84, "activity_entity", "activity_entity", "Activity entity", "mdi:remote-tv") { prefs.activityEntity },
+        settingText(85, "idle_states", "idle_states", "Idle activity states", "mdi:power-sleep") {
+            prefs.rawString("idle_states") ?: "off" },
+        settingText(86, "weather_entity", "weather_entity", "Weather entity", "mdi:weather-partly-cloudy") {
+            prefs.weatherEntity },
+        settingSelect(87, "keep_awake", "keep_awake", "Keep screen on", "mdi:cellphone-lock",
+            HostPrefs.KEEP_MODES) { prefs.keepAwake },
+        settingNumber(88, "dim_after", "dim_after_s", "Dim after", "mdi:brightness-4",
+            0, 3600, unit = "s") { prefs.dimAfterSec },
+        settingNumber(89, "dim_level", "dim_level_pct", "Dimmed brightness", "mdi:brightness-5",
+            0, 100, unit = "%") { prefs.dimLevelPct },
+        settingNumber(90, "keep_on_limit", "awake_limit_min", "Keep-on limit", "mdi:timer-sand",
+            0, 1440, unit = "min") { prefs.awakeLimitMin },
+        settingSwitch(91, "cradle_no_limit", "cradle_no_limit", "No keep-on limit on the cradle",
+            "mdi:power-plug") { prefs.cradleNoLimit },
+        settingSwitch(92, "proximity_wake", "proximity_wake", "Proximity wake", "mdi:hand-wave") { prefs.proximityWake },
+        settingSwitch(93, "screensaver_when_dimmed", "screensaver_when_dimmed", "Screensaver when dimmed",
+            "mdi:image-filter-hdr") { prefs.screensaverWhenDimmed },
+        settingNumber(94, "charging_screen", "charge_screen_s", "Charging screen", "mdi:battery-charging",
+            0, 60, unit = "s") { prefs.chargeScreenSec },
+        settingSwitch(95, "battery_readout", "status_show", "Battery readout", "mdi:battery") { prefs.statusShow },
+        settingSelect(96, "battery_readout_position", "status_pos", "Battery readout position",
+            "mdi:format-align-center", listOf("center", "left", "right")) { prefs.statusPos },
+        settingNumber(97, "battery_readout_size", "status_size_sp", "Battery readout size", "mdi:format-size",
+            6, 24, unit = "sp") { prefs.statusSizeSp },
+        settingNumber(98, "long_press", "long_press_ms", "Long press", "mdi:gesture-tap-hold",
+            200, 3000, step = 50, unit = "ms") { prefs.longPressMs },
+        EspNumber(99, "screen_timeout", "Android screen timeout", "mdi:timer-outline", EspEntity.CAT_CONFIG,
+            min = 5f, max = 3600f, step = 1f, unit = "s", mode = 1,
+            read = { systemInt(Settings.System.SCREEN_OFF_TIMEOUT)?.let { it / 1000f } },
+            write = { s -> putSystemInt(Settings.System.SCREEN_OFF_TIMEOUT, s.roundToInt().coerceIn(5, 3600) * 1000) }),
     )
 
     /** Entity states HA should forward to the remote: the activity select and the weather. */
@@ -162,6 +206,46 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
         }
     }
 
+    // ---------- settings ----------
+
+    /** Saves, then has the service and the activity re-apply everything (and reload the page if asked). */
+    private fun saveSetting(reloadsPage: Boolean = false, change: SharedPreferences.Editor.() -> Unit) {
+        prefs.edit {
+            change()
+            if (reloadsPage) putBoolean("reload_pending", true)
+        }
+        Log.i(TAG, "setting changed from Home Assistant")
+        main.post {
+            HostService.reload(context)
+            HostState.fire(HostState.Event.SETTINGS_CHANGED)
+        }
+    }
+
+    /** Blank = back to the default, like an empty field in Settings. */
+    private fun SharedPreferences.Editor.putOrRemove(pref: String, value: String) {
+        value.trim().let { if (it.isEmpty()) remove(pref) else putString(pref, it) }
+    }
+
+    private fun settingText(key: Int, id: String, pref: String, name: String, icon: String,
+                            reloadsPage: Boolean = false, read: () -> String) =
+        EspText(key, id, name, icon, EspEntity.CAT_CONFIG, read = read,
+            write = { v -> saveSetting(reloadsPage) { putOrRemove(pref, v) } })
+
+    private fun settingSelect(key: Int, id: String, pref: String, name: String, icon: String,
+                              options: List<String>, reloadsPage: Boolean = false, read: () -> String) =
+        EspSelect(key, id, name, icon, EspEntity.CAT_CONFIG, options, read = read,
+            write = { v -> if (v in options) saveSetting(reloadsPage) { putString(pref, v) } })
+
+    private fun settingNumber(key: Int, id: String, pref: String, name: String, icon: String,
+                              min: Int, max: Int, step: Int = 1, unit: String, read: () -> Int) =
+        EspNumber(key, id, name, icon, EspEntity.CAT_CONFIG, min.toFloat(), max.toFloat(), step.toFloat(), unit,
+            mode = 1, read = { read().toFloat() },
+            write = { v -> saveSetting { putInt(pref, v.roundToInt().coerceIn(min, max)) } })
+
+    private fun settingSwitch(key: Int, id: String, pref: String, name: String, icon: String, read: () -> Boolean) =
+        EspSwitch(key, id, name, icon, EspEntity.CAT_CONFIG, read = read,
+            write = { on -> saveSetting { putBoolean(pref, on) } })
+
     // ---------- actions ----------
 
     @Suppress("DEPRECATION") // simplest way to light the screen from a service on 8.1
@@ -180,6 +264,11 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
     private fun bringToFront() {
         context.startActivity(Intent(context, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
+    }
+
+    private fun openSettings() {
+        wake()
+        context.startActivity(Intent(context, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     private fun restartApp() {
