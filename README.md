@@ -24,13 +24,16 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.example.harmoniumhost/.MainActivity
 ```
 
-Check you're running this build: the settings title shows the version (0.3), and
-`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.3 starting`.
+Check you're running this build: the settings title shows the version (0.4), and
+`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.4 starting`.
 
 ## Settings
 
 Open settings in any of these ways:
-- **Swipe down from the top edge of the screen** (like Android's own pull-down).
+- **Touch and hold near the top edge of the screen** for a second (within about a finger's
+  width of the edge). It's a hold, not a swipe: the Astrion firmware takes a swipe down from the
+  top edge for its own settings panel.
+- Press **Open settings on the remote** on the device in Home Assistant.
 - Open **Harmonium settings** from the Android app drawer.
 - `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`
 
@@ -46,6 +49,9 @@ The minimum setup:
 
 Harmonium signs in with its own pairing (approve the remote in the Studio). A token field is
 there if you'd rather hand it one.
+
+Once the remote is in Home Assistant, most settings can also be changed there, on the device
+page under **Configuration** (see below). Changes apply right away.
 
 ## Voice: add the remote to Home Assistant
 
@@ -69,10 +75,19 @@ sentence. Releasing the button always ends it.
 | Kind | Entities |
 |---|---|
 | Controls | Screen (switch), Screensaver (switch), Screensaver mode (black / clock / weather), Adaptive brightness (switch), Screen brightness (%), Volume (%) |
-| Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot |
+| Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot, Open settings on the remote |
 | Camera | Screenshot (a fresh one each time HA asks, or after "Take screenshot") |
-| Sensors | Battery, Charging, Ambient light (lux, only while the screen is on), Last interaction, Activity running |
-| Diagnostics | Android version, App version, App uptime, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Last seen, Network uptime, RAM available/total, Wi-Fi signal |
+| Sensors | Battery, Charging, Last interaction, Activity running |
+| Settings | Home Assistant URL, Harmonium page path, Remote profile, Start page, Activity entity, Idle activity states, Weather entity, Keep screen on, Dim after, Dimmed brightness, Keep-on limit, No keep-on limit on the cradle, Proximity wake, Screensaver when dimmed, Charging screen, Battery readout (on/off, position, size), Long press, Android screen timeout |
+| Diagnostics | Android version, App version, App uptime, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Network uptime, RAM available/total, Wi-Fi signal |
+
+The settings are the same values as the remote's Settings screen; a change from either side
+applies right away (page settings reload Harmonium). Left out on purpose: the token (it would
+show as a plain entity state), the device names (renaming the ESPHome device from HA would cut
+HA's own connection), the mic button (learned on the remote) and the key rules (longer than
+HA's 255-character text limit). A text setting cleared to blank goes back to its default.
+If the remote's Settings screen is open while HA changes something, close it without saving,
+or the screen's older values win.
 
 Some controls need a one-time permission, granted from the remote's Settings → Permissions:
 - **Screen off**: device admin ("force lock"). Without it, turning the screen off shows a black

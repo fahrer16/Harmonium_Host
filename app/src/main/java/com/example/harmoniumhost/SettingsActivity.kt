@@ -42,8 +42,8 @@ import com.example.harmoniumhost.HarmoniumStyle as S
 
 /**
  * Every setting the remote needs, saved on the remote (SharedPreferences via [HostPrefs]).
- * Open it by swiping down from the top edge of the screen, from the launcher ("Harmonium
- * settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
+ * Open it by touching and holding near the top edge of the screen for a second, from Home
+ * Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
  * Styled like Harmonium (see [HarmoniumStyle]); every control is D-pad reachable and shows the
  * amber focus ring. Plain views built in code: nothing to inflate, and fields are one line each.
  */
@@ -117,7 +117,9 @@ class SettingsActivity : AppCompatActivity() {
         note("This remote is an ESPHome device. In Home Assistant: Settings → Devices & services. " +
             "Accept the discovered \"${prefs.espFriendlyName}\", or Add integration → ESPHome → " +
             "host ${ipAddress() ?: "<this remote's IP>"}, port ${EspServer.PORT}. Then open the device " +
-            "to set its area and its Assistant (pipeline). Hold the mic button and speak.")
+            "to set its area and its Assistant (pipeline). Hold the mic button and speak. " +
+            "Most settings on this screen are also on that device page (Configuration), so they can be " +
+            "changed from Home Assistant too.")
         text("esp_name", "Device name (a-z, 0-9, -)", prefs.rawString("esp_name") ?: "", hint = prefs.espName)
         text("esp_friendly_name", "Friendly name", prefs.rawString("esp_friendly_name") ?: "",
             hint = prefs.espFriendlyName)
@@ -360,7 +362,7 @@ class SettingsActivity : AppCompatActivity() {
                 setTextColor(S.TEXT)
             })
             addView(TextView(this@SettingsActivity).apply {
-                text = "Version ${app.versionName} · swipe down from the top to come back here"
+                text = "Version ${app.versionName} · hold a finger near the top edge to come back here"
                 textSize = 12f
                 setTextColor(S.DIM)
             })

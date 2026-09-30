@@ -80,6 +80,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private const val SELECT_COMMAND = 54
         private const val LIST_BUTTON = 61
         private const val BUTTON_COMMAND = 62
+        private const val LIST_TEXT = 97
+        private const val TEXT_STATE = 98
+        private const val TEXT_COMMAND = 99
         private const val SUBSCRIBE_VOICE = 89
         private const val VOICE_REQUEST = 90
         private const val VOICE_RESPONSE = 91
@@ -155,6 +158,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         advertise()
     }
 
+    /** Asks HA to forward any entity in [haSubscriptions] not asked for yet (e.g. a new activity entity). */
+    fun resubscribe() = connections.forEach { it.subscribeHa() }
+
     /** Re-reads every entity and sends the ones that changed. Cheap; coalesced; callable from any thread. */
     fun refresh() {
         if (!refreshQueued.compareAndSet(false, true)) return
@@ -216,9 +222,11 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 .string(8, e.deviceClass).toByteArray()
             is EspSwitch -> LIST_SWITCH to w.string(5, e.icon).uint(8, e.category.toLong()).toByteArray()
             is EspNumber -> LIST_NUMBER to w.string(5, e.icon).float(6, e.min).float(7, e.max).float(8, e.step)
-                .uint(10, e.category.toLong()).string(11, e.unit).uint(12, 2).toByteArray()   // mode: slider
+                .uint(10, e.category.toLong()).string(11, e.unit).uint(12, e.mode.toLong()).toByteArray()
             is EspSelect -> LIST_SELECT to w.string(5, e.icon).apply { e.options.forEach { string(6, it) } }
                 .uint(8, e.category.toLong()).toByteArray()
+            is EspText -> LIST_TEXT to w.string(5, e.icon).uint(7, e.category.toLong())
+                .uint(9, e.maxLength.toLong()).toByteArray()           // min_length 0, mode TEXT
             is EspButton -> LIST_BUTTON to w.string(5, e.icon).uint(7, e.category.toLong()).toByteArray()
             is EspCamera -> LIST_CAMERA to w.string(6, e.icon).uint(7, e.category.toLong()).toByteArray()
         }
@@ -234,6 +242,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             is EspSwitch -> e.read().let { v -> SWITCH_STATE to w.bool(2, v == true).bool(4, v == null).toByteArray() }
             is EspNumber -> e.read().let { v -> NUMBER_STATE to w.float(2, v ?: 0f).bool(3, v == null).toByteArray() }
             is EspSelect -> e.read().let { v -> SELECT_STATE to w.string(2, v ?: "").bool(3, v == null).toByteArray() }
+            is EspText -> e.read().let { v -> TEXT_STATE to w.string(2, (v ?: "").take(e.maxLength)).bool(3, v == null).toByteArray() }
             is EspButton, is EspCamera -> null
         }
     }
@@ -249,6 +258,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 type == SWITCH_COMMAND && e is EspSwitch -> e.write(r.bool(2))
                 type == NUMBER_COMMAND && e is EspNumber -> e.write(r.float(2))
                 type == SELECT_COMMAND && e is EspSelect -> e.write(r.string(2))
+                type == TEXT_COMMAND && e is EspText -> e.write(r.string(2))
                 type == BUTTON_COMMAND && e is EspButton -> e.press()
             }
         } catch (ex: Exception) {
@@ -301,6 +311,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private val peer = socket.inetAddress?.hostAddress ?: "?"
         @Volatile private var closed = false
         @Volatile var statesWanted = false
+        /** HA accepts entity-state subscriptions on this connection; the ones already asked for. */
+        @Volatile private var haStatesWanted = false
+        private val haSubscribed = HashSet<Pair<String, String>>()
         /** Last state payload sent per entity key (writer thread only). */
         private val sent = HashMap<Int, ByteArray>()
 
@@ -373,6 +386,17 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             write(msg.first, msg.second)
         }
 
+        /** Subscriptions last until HA disconnects, so only new (entity, attribute) pairs are sent. */
+        fun subscribeHa() {
+            if (!haStatesWanted) return
+            val fresh = synchronized(haSubscribed) {
+                haSubscriptions().filter { it.first.isNotEmpty() && haSubscribed.add(it) }
+            }
+            fresh.forEach { (entity, attr) ->
+                send(SUBSCRIBE_HA_STATE, ProtoWriter().string(1, entity).string(2, attr).toByteArray())
+            }
+        }
+
         fun close() {
             closed = true
             if (!connections.remove(this)) return
@@ -409,14 +433,15 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                     refresh()
                 }
                 // HA forwards these entities' states from now on (no token or permission needed).
-                SUBSCRIBE_HA_STATES -> haSubscriptions().forEach { (entity, attr) ->
-                    if (entity.isNotEmpty()) send(SUBSCRIBE_HA_STATE, ProtoWriter().string(1, entity).string(2, attr).toByteArray())
+                SUBSCRIBE_HA_STATES -> {
+                    haStatesWanted = true
+                    subscribeHa()
                 }
                 HA_STATE -> {
                     val r = ProtoReader(payload)
                     onHaState(r.string(1), r.string(3), r.string(2))
                 }
-                SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND -> command(type, payload)
+                SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND, TEXT_COMMAND -> command(type, payload)
                 CAMERA_REQUEST -> entities.filterIsInstance<EspCamera>().firstOrNull()?.let { pushImage(it) }
                 SUBSCRIBE_VOICE -> {
                     val r = ProtoReader(payload)

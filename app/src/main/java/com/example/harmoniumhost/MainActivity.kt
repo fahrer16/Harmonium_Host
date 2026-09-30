@@ -45,10 +45,14 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         const val TAG = "HarmoniumHost"
-        /** A swipe that starts this close to the top edge… */
-        private const val SWIPE_EDGE_DP = 36
-        /** …and travels this far down opens Settings. */
-        private const val SWIPE_DISTANCE_DP = 90
+        /**
+         * Touching and holding this close to the top edge opens Settings. Not a swipe: the Astrion
+         * firmware takes a swipe down from the top edge for its own settings panel.
+         */
+        private const val HOLD_ZONE_DP = 64
+        private const val HOLD_MS = 1_000L
+        /** Moving further than this means scrolling, not holding. */
+        private const val HOLD_SLOP_DP = 16
         /** Last-interaction is reported to HA at most this often. */
         private const val INTERACTION_REPORT_MS = 10_000L
 
@@ -86,9 +90,9 @@ class MainActivity : AppCompatActivity() {
     private val remap = KeyRemap { window.superDispatchKeyEvent(it) }
     private val hideVoiceOverlay = Runnable { voiceOverlay.visibility = View.GONE }
     private var swallowGesture = false
-    private var swipeFromTop = false
-    private var swipeX = 0f
-    private var swipeY = 0f
+    private val holdToOpenSettings = Runnable { openSettings() }
+    private var holdX = 0f
+    private var holdY = 0f
     private var lastInteractionReport = 0L
 
     private val hostListener = object : HostState.Listener {
@@ -125,6 +129,13 @@ class MainActivity : AppCompatActivity() {
                 HostState.Event.SCREEN_BLACK -> {
                     screensaver.show("black")
                     keeper.dimNow()
+                }
+                HostState.Event.SETTINGS_CHANGED -> {
+                    applySettings()
+                    if (prefs.reloadPending) {
+                        prefs.reloadPending = false
+                        loadHarmonium()
+                    }
                 }
             }
         }
@@ -332,29 +343,27 @@ class MainActivity : AppCompatActivity() {
             }
             return true
         }
-        watchSwipeDown(ev)
+        watchHoldAtTop(ev)
         return super.dispatchTouchEvent(ev)
     }
 
-    /** Swipe down from the top edge opens Settings (like Android's own pull-down). Watches only. */
-    private fun watchSwipeDown(ev: MotionEvent) {
+    /** One finger held still near the top edge for [HOLD_MS] opens Settings. Watches only. */
+    private fun watchHoldAtTop(ev: MotionEvent) {
         val dp = resources.displayMetrics.density
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                swipeFromTop = ev.y < SWIPE_EDGE_DP * dp
-                swipeX = ev.x
-                swipeY = ev.y
-            }
-            MotionEvent.ACTION_MOVE -> if (swipeFromTop) {
-                val dy = ev.y - swipeY
-                val dx = abs(ev.x - swipeX)
-                if (dx > dy) swipeFromTop = dx < 24 * dp           // sideways: not our gesture
-                else if (dy > SWIPE_DISTANCE_DP * dp) {
-                    swipeFromTop = false
-                    openSettings()
+                root.removeCallbacks(holdToOpenSettings)
+                if (ev.y < HOLD_ZONE_DP * dp) {
+                    holdX = ev.x
+                    holdY = ev.y
+                    root.postDelayed(holdToOpenSettings, HOLD_MS)
                 }
             }
-            else -> swipeFromTop = false
+            MotionEvent.ACTION_MOVE ->
+                if (abs(ev.x - holdX) > HOLD_SLOP_DP * dp || abs(ev.y - holdY) > HOLD_SLOP_DP * dp) {
+                    root.removeCallbacks(holdToOpenSettings)
+                }
+            else -> root.removeCallbacks(holdToOpenSettings)    // lifted, cancelled, or a second finger
         }
     }
 

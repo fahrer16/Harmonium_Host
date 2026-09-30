@@ -18,6 +18,8 @@ object HostState {
         RELOAD, CLEAR_CACHE, SCREENSAVER_ON, SCREENSAVER_OFF,
         /** "Screen off" without device-admin rights: a black screensaver at minimum brightness. */
         SCREEN_BLACK,
+        /** Settings were changed from Home Assistant: re-apply them (and reload the page if asked). */
+        SETTINGS_CHANGED,
     }
 
     interface Listener {
@@ -50,7 +52,6 @@ object HostState {
     @Volatile var lastInteractionAt = System.currentTimeMillis()
     @Volatile var screensaverOn = false
     @Volatile var appInForeground = false
-    @Volatile var lux: Float? = null
     @Volatile var weatherCondition = ""
     @Volatile var weatherTemperature = ""
     @Volatile var weatherUnit = ""
