@@ -170,6 +170,7 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
         settingSwitch(91, "cradle_no_limit", "cradle_no_limit", "No keep-on limit on the cradle",
             "mdi:power-plug") { prefs.cradleNoLimit },
         settingSwitch(92, "proximity_wake", "proximity_wake", "Proximity wake", "mdi:hand-wave") { prefs.proximityWake },
+        settingSwitch(100, "lift_wake", "lift_wake", "Wake when picked up", "mdi:hand-back-right") { prefs.liftWake },
         settingSwitch(93, "screensaver_when_dimmed", "screensaver_when_dimmed", "Screensaver when dimmed",
             "mdi:image-filter-hdr") { prefs.screensaverWhenDimmed },
         settingNumber(94, "charging_screen", "charge_screen_s", "Charging screen", "mdi:battery-charging",

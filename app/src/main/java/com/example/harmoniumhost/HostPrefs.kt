@@ -137,6 +137,11 @@ class HostPrefs(context: Context) {
     /** On the cradle, battery isn't a concern: ignore [awakeLimitMin] there. */
     val cradleNoLimit get() = bool("cradle_no_limit", true)
     val proximityWake get() = bool("proximity_wake", true)
+    /**
+     * Wake the screen when the remote is picked up (accelerometer). The stock Astrion app did this;
+     * the sensor only reports while the processor is awake, so it costs battery off the cradle.
+     */
+    val liftWake get() = bool("lift_wake", true)
 
     // ---- Screensaver ----
     val screensaverMode get() = str("screensaver_mode", "clock").takeIf { it in SCREENSAVER_MODES } ?: "clock"

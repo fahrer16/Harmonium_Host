@@ -24,6 +24,7 @@ import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 
 /**
  * Always-running companion to MainActivity:
@@ -31,6 +32,8 @@ import java.util.Locale
  *  - on the cradle: wake briefly so the charging screen is seen
  *  - off the cradle: wake immediately (you're about to use it)
  *  - proximity (the device's only wake-up sensor): wake when a hand comes near
+ *  - lift-to-wake: off the cradle with the screen off, watch the accelerometer (needs the CPU
+ *    awake: a partial wake lock, only then) and light the screen when the remote moves
  *  - the ESPHome API server: voice satellite, controls and diagnostics for Home Assistant
  *  - while the screen is on: Wi-Fi out of power save
  */
@@ -43,6 +46,10 @@ class HostService : Service() {
         private const val TAG = "HarmoniumHost"
         private const val CHANNEL = "host"
         private const val PROXIMITY_WAKE_GAP_MS = 3_000L
+        /** Accelerometer rate while watching for a pickup: 10 Hz is plenty to feel a lift. */
+        private const val LIFT_SAMPLE_US = 100_000
+        /** Change between samples (sum over x, y, z, m/s²) that counts as movement; resting noise is ~0.2. */
+        private const val LIFT_THRESHOLD = 1.2f
 
         fun reload(context: Context, espChanged: Boolean = false) = ContextCompat.startForegroundService(
             context, Intent(context, HostService::class.java).setAction(ACTION_RELOAD)
@@ -56,6 +63,7 @@ class HostService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var proximity: Sensor? = null
     private var lastProximityWake = 0L
+    private var liftLock: PowerManager.WakeLock? = null
     private val clock = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     // Must be registered at runtime: manifest receivers don't get these since Android 8.0.
@@ -77,6 +85,7 @@ class HostService : Service() {
                     val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
                     val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
                     HostState.setBattery(pct, plugged, plugged && status == BatteryManager.BATTERY_STATUS_FULL)
+                    watchForLift()
                     app.esp.refresh()        // queued on the ESPHome writer thread, never the main thread
                 }
                 Intent.ACTION_SCREEN_ON -> screen(true)
@@ -99,6 +108,27 @@ class HostService : Service() {
             }
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    /** Two jolts within a few samples = picked up (a single one is often a knock on the table). */
+    private val liftListener = object : SensorEventListener {
+        private var last: FloatArray? = null
+        private var score = 0
+        override fun onSensorChanged(e: SensorEvent) {
+            val v = e.values
+            val p = last
+            last = floatArrayOf(v[0], v[1], v[2])
+            if (p == null) return
+            val d = abs(v[0] - p[0]) + abs(v[1] - p[1]) + abs(v[2] - p[2])
+            score = if (d > LIFT_THRESHOLD) score + 2 else (score - 1).coerceAtLeast(0)
+            if (score >= 4 && !power.isInteractive) {
+                score = 0
+                Log.i(TAG, "lift wake (movement ${"%.1f".format(d)})")
+                wakeScreen(1_000)
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        fun reset() { last = null; score = 0 }
     }
 
     private val network = object : ConnectivityManager.NetworkCallback() {
@@ -164,6 +194,7 @@ class HostService : Service() {
     override fun onDestroy() {
         unregisterReceiver(events)
         sensors.unregisterListener(proximityListener)
+        stopLiftWatch()
         try {
             (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(network)
         } catch (e: Exception) {}
@@ -180,12 +211,14 @@ class HostService : Service() {
         } else {
             wifiLock?.release()
         }
+        watchForLift()
         app.esp.refresh()
     }
 
     // ---------- proximity ----------
 
     private fun applySettings() {
+        watchForLift()
         val want = app.prefs.proximityWake
         if (want && proximity == null) {
             // The only wake-up sensor on the HA100, and on-change: costs almost nothing idle.
@@ -203,6 +236,29 @@ class HostService : Service() {
             proximity = null
             Log.i(TAG, "proximity wake off")
         }
+    }
+
+    // ---------- lift-to-wake ----------
+
+    /** Watch for a pickup only while it matters: screen off, off the cradle, setting on. */
+    private fun watchForLift() {
+        val want = app.prefs.liftWake && !power.isInteractive && !HostState.charging
+        if (want == (liftLock != null)) return
+        if (!want) { stopLiftWatch(); return }
+        val accel = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
+        liftLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "harmoniumhost:lift")
+            .apply { setReferenceCounted(false); acquire() }
+        liftListener.reset()
+        sensors.registerListener(liftListener, accel, LIFT_SAMPLE_US)
+        Log.i(TAG, "watching for a pickup")
+    }
+
+    private fun stopLiftWatch() {
+        val lock = liftLock ?: return
+        sensors.unregisterListener(liftListener)
+        lock.release()
+        liftLock = null
+        Log.i(TAG, "stopped watching for a pickup")
     }
 
     // ---------- helpers ----------

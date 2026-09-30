@@ -12,7 +12,7 @@ import java.util.Random
 
 /**
  * Full-screen screensaver: black, clock, or clock + weather (from an HA weather entity the
- * ESPHome link forwards). TextClock ticks once a minute; the content drifts a little each minute
+ * ESPHome link forwards). The clock styles also show the battery and whether it's charging. TextClock ticks once a minute; the content drifts a little each minute
  * so nothing sits in one place. A tap hides it; keys hide it AND still reach Harmonium.
  */
 class Screensaver(context: Context) : FrameLayout(context) {
@@ -34,6 +34,12 @@ class Screensaver(context: Context) : FrameLayout(context) {
         setTextColor(HarmoniumStyle.DIM)
         gravity = Gravity.CENTER
     }
+    private val battery = TextView(context).apply {
+        textSize = 15f
+        setTextColor(HarmoniumStyle.DIM)
+        gravity = Gravity.CENTER
+        setPadding(0, (10 * dp).toInt(), 0, 0)
+    }
     private val weather = TextView(context).apply {
         textSize = 20f
         setTextColor(HarmoniumStyle.TEXT)
@@ -46,6 +52,7 @@ class Screensaver(context: Context) : FrameLayout(context) {
         addView(time)
         addView(date)
         addView(weather)
+        addView(battery)
     }
     private val drift = object : Runnable {
         override fun run() {
@@ -69,7 +76,7 @@ class Screensaver(context: Context) : FrameLayout(context) {
     fun show(mode: String) {
         content.visibility = if (mode == "black") View.GONE else View.VISIBLE
         weather.visibility = if (mode == "weather") View.VISIBLE else View.GONE
-        updateWeather()
+        update()
         if (!showing) {
             visibility = VISIBLE
             removeCallbacks(drift)
@@ -86,7 +93,20 @@ class Screensaver(context: Context) : FrameLayout(context) {
         HostApp.of(context).esp.refresh()
     }
 
-    fun updateWeather() {
+    /** Re-reads the weather and the battery (called when HostState changes while showing). */
+    fun update() {
+        val level = HostState.batteryLevel
+        battery.text = when {
+            level < 0 -> ""
+            HostState.batteryFull -> "⚡ $level%  ·  fully charged"
+            HostState.charging -> "⚡ $level%  ·  charging"
+            else -> "$level%"
+        }
+        battery.setTextColor(if (HostState.charging) HarmoniumStyle.OK else HarmoniumStyle.DIM)
+        updateWeather()
+    }
+
+    private fun updateWeather() {
         val condition = HostState.weatherCondition
         weather.text = if (condition.isEmpty()) {
             "Set a weather entity in Settings"
