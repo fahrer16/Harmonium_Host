@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.harmoniumhost"
         minSdk = 27
         targetSdk = 37
-        versionCode = 5
-        versionName = "0.4"
+        versionCode = 6
+        versionName = "0.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

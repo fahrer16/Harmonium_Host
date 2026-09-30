@@ -49,7 +49,6 @@ object HostState {
 
     // Written by MainActivity / HostService, read by the ESPHome entities.
     @Volatile var pageUrl = ""
-    @Volatile var lastInteractionAt = System.currentTimeMillis()
     @Volatile var screensaverOn = false
     @Volatile var appInForeground = false
     @Volatile var weatherCondition = ""

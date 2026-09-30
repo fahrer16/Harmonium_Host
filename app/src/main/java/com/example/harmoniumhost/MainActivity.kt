@@ -47,15 +47,16 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val TAG = "HarmoniumHost"
         /**
-         * Touching and holding this close to the top edge opens Settings. Not a swipe: the Astrion
-         * firmware takes a swipe down from the top edge for its own settings panel.
+         * Two ways to open Settings, both only watched (Harmonium still gets the touch): a swipe
+         * down from the top edge, and touching and holding near it. The Astrion firmware can take
+         * the swipe for its own panel (less so once this app is the home screen); the hold still works.
          */
+        private const val SWIPE_EDGE_DP = 36
+        private const val SWIPE_DISTANCE_DP = 90
         private const val HOLD_ZONE_DP = 64
         private const val HOLD_MS = 1_000L
         /** Moving further than this means scrolling, not holding. */
         private const val HOLD_SLOP_DP = 16
-        /** Last-interaction is reported to HA at most this often. */
-        private const val INTERACTION_REPORT_MS = 10_000L
 
         private const val NO_SIDEWAYS_SCROLL = """(function(){
             if (document.getElementById('hh-noside')) return;
@@ -94,7 +95,8 @@ class MainActivity : AppCompatActivity() {
     private val holdToOpenSettings = Runnable { openSettings() }
     private var holdX = 0f
     private var holdY = 0f
-    private var lastInteractionReport = 0L
+    private var swipeFromTop = false
+    private var setupPromptOpen = false
     /** The screen-on that HA's screensaver switch causes must not hide the screensaver again. */
     private var keepScreensaverUntil = 0L
 
@@ -239,6 +241,9 @@ class MainActivity : AppCompatActivity() {
         applySettings()
 
         if (!prefs.setupDone) root.post { openSettings() }
+        // Screenshots of any app: Android needs its dialog again after every app start (silent
+        // once "Don't show again" was ticked).
+        else if (prefs.captureGranted && !ScreenCapture.ready) ScreenCapture.requestConsent(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -260,6 +265,7 @@ class MainActivity : AppCompatActivity() {
             loadHarmonium()
         }
         interaction()
+        askSetupQuestions()
     }
 
     override fun onPause() {
@@ -296,18 +302,44 @@ class MainActivity : AppCompatActivity() {
         keeper.evaluate()
     }
 
-    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+    private fun openSettings() {
+        Log.i(TAG, "opening Settings")
+        startActivity(Intent(this, SettingsActivity::class.java))
+    }
+
+    /**
+     * One-time questions for the Android-level grants the remote uses. Each is asked once (Settings
+     * → Permissions has them all); "Open" goes to the system screen, and the next question
+     * follows when the remote comes back here.
+     */
+    private fun askSetupQuestions() {
+        if (setupPromptOpen || !prefs.setupDone) return
+        data class Q(val key: String, val needed: Boolean, val title: String, val text: String, val open: () -> Unit)
+        val q = listOf(
+            Q("home", !SystemAccess.isHome(this), "Make Harmonium Host the home screen?",
+                "The Home button then comes back here, it starts by itself after a reboot, and the stock " +
+                "Astrion app stays in the background. On the next screen choose Harmonium Host.") {
+                SystemAccess.openHomeSettings(this) },
+            Q("usage", !SystemAccess.hasUsageAccess(this), "Allow usage access?",
+                "Lets Home Assistant see which app is in front (the Foreground app sensor). On the next " +
+                "screen pick Harmonium Host and turn it on.") { SystemAccess.openUsageAccess(this) },
+            Q("capture", !ScreenCapture.ready && !prefs.captureGranted, "Allow screenshots of any app?",
+                "Home Assistant's Take screenshot then shows whatever is on screen, not only Harmonium. " +
+                "Android asks next: tick \"Don't show again\" and choose Start now, or it asks again " +
+                "each time the app starts.") { ScreenCapture.requestConsent(this) },
+        ).firstOrNull { it.needed && !prefs.asked(it.key) } ?: return
+        setupPromptOpen = true
+        android.app.AlertDialog.Builder(this).setTitle(q.title).setMessage(q.text)
+            .setPositiveButton("Open") { _, _ -> prefs.markAsked(q.key); q.open() }
+            .setNegativeButton("Not now") { _, _ -> prefs.markAsked(q.key); root.post { askSetupQuestions() } }
+            .setOnDismissListener { setupPromptOpen = false }
+            .show()
+    }
 
     /** A press, touch, wake or approaching hand: brighten, restart the idle timers, drop the screensaver. */
     private fun interaction() {
         keeper.interaction()
         screensaver.hide()
-        HostState.lastInteractionAt = System.currentTimeMillis()
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastInteractionReport > INTERACTION_REPORT_MS) {
-            lastInteractionReport = now
-            app.esp.refresh()
-        }
     }
 
     // ---------- input ----------
@@ -352,27 +384,40 @@ class MainActivity : AppCompatActivity() {
             }
             return true
         }
-        watchHoldAtTop(ev)
+        watchSettingsGesture(ev)
         return super.dispatchTouchEvent(ev)
     }
 
-    /** One finger held still near the top edge for [HOLD_MS] opens Settings. Watches only. */
-    private fun watchHoldAtTop(ev: MotionEvent) {
+    /**
+     * Opens Settings on a swipe down from the top edge, or on one finger held still near it for
+     * [HOLD_MS]. Watches only.
+     */
+    private fun watchSettingsGesture(ev: MotionEvent) {
         val dp = resources.displayMetrics.density
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 root.removeCallbacks(holdToOpenSettings)
-                if (ev.y < HOLD_ZONE_DP * dp) {
-                    holdX = ev.x
-                    holdY = ev.y
-                    root.postDelayed(holdToOpenSettings, HOLD_MS)
+                holdX = ev.x
+                holdY = ev.y
+                swipeFromTop = ev.y < SWIPE_EDGE_DP * dp
+                if (ev.y < HOLD_ZONE_DP * dp) root.postDelayed(holdToOpenSettings, HOLD_MS)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = abs(ev.x - holdX)
+                val dy = ev.y - holdY
+                if (dx > HOLD_SLOP_DP * dp || abs(dy) > HOLD_SLOP_DP * dp) root.removeCallbacks(holdToOpenSettings)
+                if (swipeFromTop) {
+                    if (dx > dy && dx > 24 * dp) swipeFromTop = false        // sideways: not ours
+                    else if (dy > SWIPE_DISTANCE_DP * dp) {
+                        swipeFromTop = false
+                        openSettings()
+                    }
                 }
             }
-            MotionEvent.ACTION_MOVE ->
-                if (abs(ev.x - holdX) > HOLD_SLOP_DP * dp || abs(ev.y - holdY) > HOLD_SLOP_DP * dp) {
-                    root.removeCallbacks(holdToOpenSettings)
-                }
-            else -> root.removeCallbacks(holdToOpenSettings)    // lifted, cancelled, or a second finger
+            else -> {                                             // lifted, cancelled, or a second finger
+                root.removeCallbacks(holdToOpenSettings)
+                swipeFromTop = false
+            }
         }
     }
 

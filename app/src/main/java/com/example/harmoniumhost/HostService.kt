@@ -116,6 +116,8 @@ class HostService : Service() {
         device = RemoteDevice(this, app.esp)
         app.device = device
         app.esp.entities = device.entities
+        app.esp.services = device.services
+        app.esp.onActionsReady = { device.requestEntityLists() }
         app.esp.haSubscriptions = { device.haSubscriptions() }
         app.esp.onHaState = { id, attr, state -> device.onHaState(id, attr, state) }
         app.esp.start()
