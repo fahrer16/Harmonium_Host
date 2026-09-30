@@ -2,7 +2,6 @@ package com.example.harmoniumhost
 
 import android.Manifest
 import android.app.AlertDialog
-import android.app.AppOpsManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Intent
@@ -12,7 +11,6 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
-import android.os.Process
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
@@ -41,8 +39,8 @@ import com.example.harmoniumhost.HarmoniumStyle as S
 
 /**
  * Every setting the remote needs, saved on the remote (SharedPreferences via [HostPrefs]).
- * Open it by touching and holding near the top edge of the screen for a second, from Home
- * Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
+ * Open it with a swipe down from the top edge or by touching and holding near it for a second,
+ * from Home Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
  * Styled like Harmonium (see [HarmoniumStyle]); every control is D-pad reachable and shows the
  * amber focus ring. Plain views built in code: nothing to inflate, and fields are one line each.
  */
@@ -103,8 +101,8 @@ class SettingsActivity : AppCompatActivity() {
         text("start_page", "Start page (Harmonium page id, e.g. great_room)",
             prefs.rawString("start_page") ?: "", hint = "blank = Harmonium's home")
         text("room", "Room id (as in select.harmonium_<room>_activity)", prefs.room)
-        text("activity_entity", "Activity entity", prefs.rawString("activity_entity") ?: "",
-            hint = "select.harmonium_<room>_activity")
+        entityChoice("activity_entity", "Activity entity", prefs.haActivityEntities, prefs.activityEntity,
+            prefs.rawString("activity_entity") ?: "", "select.harmonium_<room>_activity", allowNone = false)
         text("idle_states", "States that mean \"no activity\" (comma separated)",
             prefs.rawString("idle_states") ?: "off")
         tokenField = field("Token for Harmonium (optional)",
@@ -148,8 +146,8 @@ class SettingsActivity : AppCompatActivity() {
         choice("screensaver_mode", "Style", HostPrefs.SCREENSAVER_MODES.map { it to it.replaceFirstChar { c -> c.uppercase() } },
             prefs.screensaverMode)
         toggle("screensaver_when_dimmed", "Show it when the screen dims", prefs.screensaverWhenDimmed)
-        text("weather_entity", "Weather entity (for the weather style)", prefs.rawString("weather_entity") ?: "",
-            hint = "weather.home")
+        entityChoice("weather_entity", "Weather entity (for the weather style)", prefs.haWeatherEntities,
+            prefs.weatherEntity, prefs.weatherEntity, "weather.home", allowNone = true)
         note("Home Assistant can also turn the screensaver on and off (the Screensaver switch on the device).")
 
         section("Charging and battery")
@@ -178,6 +176,11 @@ class SettingsActivity : AppCompatActivity() {
 
         section("Permissions (for Home Assistant controls)")
         permissionsText = body("")
+        buttons(Triple("Home screen", false) {
+            SystemAccess.openHomeSettings(this)
+        }, Triple("Screenshots", false) {
+            ScreenCapture.requestConsent(this)
+        })
         buttons(Triple("Screen off", false) {
             startActivity(Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
                 .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this, ScreenOffAdmin::class.java))
@@ -186,7 +189,7 @@ class SettingsActivity : AppCompatActivity() {
         }, Triple("System settings", false) {
             startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
         }, Triple("Usage access", false) {
-            startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+            SystemAccess.openUsageAccess(this)
         })
 
         section("More")
@@ -260,7 +263,8 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun harmoniumInputs() =
         listOf(prefs.haUrl, prefs.harmoniumProfile, prefs.harmoniumPath, prefs.startPage, prefs.token)
-    private fun espInputs() = listOf(prefs.espName, prefs.espFriendlyName, prefs.activityEntity, prefs.weatherEntity)
+    /** Renaming needs HA to reconnect; new activity/weather entities are subscribed on the live connection. */
+    private fun espInputs() = listOf(prefs.espName, prefs.espFriendlyName)
 
     /** Checks that the Harmonium page loads from the URL typed so far. */
     private fun test() {
@@ -327,11 +331,11 @@ class SettingsActivity : AppCompatActivity() {
     private fun permissionSummary(): String {
         val admin = (getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager)
             .isAdminActive(ComponentName(this, ScreenOffAdmin::class.java))
-        @Suppress("DEPRECATION")
-        val usage = (getSystemService(APP_OPS_SERVICE) as AppOpsManager).checkOpNoThrow(
-            AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) == AppOpsManager.MODE_ALLOWED
+        val usage = SystemAccess.hasUsageAccess(this)
         fun mark(ok: Boolean) = if (ok) "✓" else "✗"
         return listOf(
+            "${mark(SystemAccess.isHome(this))} Home screen: this app is the home app (Home comes back here, starts after a reboot).",
+            "${mark(ScreenCapture.ready)} Screenshots: Home Assistant's screenshot shows any app, not only this one.",
             "${mark(admin)} Screen off: lets HA turn the screen off (device admin). Without it, \"off\" is a black screensaver.",
             "${mark(Settings.System.canWrite(this))} Modify system settings: brightness, adaptive brightness, screen timeout.",
             "${mark(usage)} Usage access: the foreground-app diagnostic.",
@@ -361,7 +365,7 @@ class SettingsActivity : AppCompatActivity() {
                 setTextColor(S.TEXT)
             })
             addView(TextView(this@SettingsActivity).apply {
-                text = "Version ${app.versionName} · hold a finger near the top edge to come back here"
+                text = "Version ${app.versionName} · swipe down from the top, or hold a finger there, to come back here"
                 textSize = 12f
                 setTextColor(S.DIM)
             })
@@ -432,6 +436,23 @@ class SettingsActivity : AppCompatActivity() {
         val f = field(title, hint, value, InputType.TYPE_CLASS_TEXT or type)
         savers += { e -> f.text.toString().trim().let { if (it.isEmpty()) e.remove(key) else e.putString(key, it) } }
         return f
+    }
+
+    /**
+     * An HA entity: a dropdown once Home Assistant has sent its list of fitting entities (see
+     * RemoteDevice.requestEntityLists), otherwise a text field.
+     */
+    private fun entityChoice(key: String, title: String, known: List<String>, current: String,
+                             typed: String, hint: String, allowNone: Boolean) {
+        if (known.isEmpty()) {
+            text(key, title, typed, hint = hint)
+            note("A list to pick from appears once this remote is in Home Assistant with \"Allow the " +
+                "device to perform Home Assistant actions\" on (ESPHome → this device → Configure).")
+            return
+        }
+        val entities = if (current.isEmpty() || current in known) known else known + current
+        val options = (if (allowNone) listOf("" to "None") else emptyList()) + entities.map { it to it }
+        choice(key, title, options, current)
     }
 
     private fun number(key: String, title: String, value: Int) {

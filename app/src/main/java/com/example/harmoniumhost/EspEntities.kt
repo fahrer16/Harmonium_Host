@@ -46,9 +46,10 @@ class EspNumber(
     val read: () -> Float?, val write: (Float) -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
 
+/** [options] is read each time HA lists the entities (on every connection), so it can change. */
 class EspSelect(
     key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
-    val options: List<String>, val read: () -> String?, val write: (String) -> Unit,
+    val options: () -> List<String>, val read: () -> String?, val write: (String) -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
 
 /** Editable text (HA's text entity). Used for settings; HA caps text states at 255 characters. */
@@ -61,6 +62,12 @@ class EspButton(
     key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
     val press: () -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
+
+/**
+ * An action HA can call on the remote; HA names it `esphome.<device name>_<name>`. String
+ * arguments only. Not an entity, but listed alongside them.
+ */
+class EspService(val key: Int, val name: String, val args: List<String>, val run: (Map<String, String>) -> Unit)
 
 /** A still image HA can show (used for screenshots). [capture] returns JPEG bytes. */
 class EspCamera(

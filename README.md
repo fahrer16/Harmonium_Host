@@ -7,8 +7,8 @@ and adds what a kiosk browser can't do:
 - **A voice assistant per remote.** The remote shows up in Home Assistant as an ESPHome device with
   an Assist satellite, so you give it an area and a pipeline like any voice satellite. Hold the
   mic button (F3), speak, release. The reply plays on the remote. Works with plain-http HA.
-- **First press always works.** While an activity is running, the screen stays on, dimmed, so no
-  key press is spent on waking it.
+- **The screen is awake when you pick it up.** Off the cradle the screen sleeps and the remote's
+  firmware wakes it when lifted; on the cradle it stays on, dimmed, with a clock screensaver.
 - **Charging feedback.** A charging screen after the remote lands on the cradle, and a small
   battery readout at the top. Battery and charging are also HA entities.
 - **Key translation** that replaces Key Mapper (Back, volume, mute, menu, long presses).
@@ -24,15 +24,17 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.example.harmoniumhost/.MainActivity
 ```
 
-Check you're running this build: the settings title shows the version (0.4), and
-`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.4 starting`.
+Check you're running this build: the settings title shows the version (0.5), and
+`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.5 starting`.
 
 ## Settings
 
 Open settings in any of these ways:
-- **Touch and hold near the top edge of the screen** for a second (within about a finger's
-  width of the edge). It's a hold, not a swipe: the Astrion firmware takes a swipe down from the
-  top edge for its own settings panel.
+- **Swipe down from the top edge**, or **touch and hold near the top edge** for a second (within
+  about a finger's width of it). The Astrion firmware can take the swipe for its own settings
+  panel; the hold works either way.
+- Press **Home**, once Harmonium Host is the home screen (it asks once; also Settings →
+  Permissions → Home screen), then use the above.
 - Press **Open settings on the remote** on the device in Home Assistant.
 - Open **Harmonium settings** from the Android app drawer.
 - `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`
@@ -45,7 +47,11 @@ The minimum setup:
 2. **Remote profile**: `astrion` or `astrion2`. Harmonium needs this to treat the remote as a
    hardware remote (D-pad passthrough to TVs, no on-screen D-pad). It's sent on every load.
 3. **Start page**: a Harmonium page id (e.g. `great_room`), or blank for Harmonium's home.
-4. **Room id**: the `<room>` in `select.harmonium_<room>_activity`, used for keep-awake.
+4. **Room id**: the `<room>` in `select.harmonium_<room>_activity`, used for the activity entity.
+
+After the first save the app asks, once each, for the Android grants it uses: to be the home
+screen, Usage access (the foreground app) and screen capture (screenshots of any app). Settings →
+Permissions shows each one and has a button for it.
 
 Harmonium signs in with its own pairing (approve the remote in the Studio). A token field is
 there if you'd rather hand it one.
@@ -76,10 +82,18 @@ sentence. Releasing the button always ends it.
 |---|---|
 | Controls | Screen (switch), Screensaver (switch), Screensaver mode (black / clock / weather), Adaptive brightness (switch), Screen brightness (%), Volume (%) |
 | Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot, Open settings on the remote |
-| Camera | Screenshot: taken only when you press "Take screenshot" (HA's own refreshes re-send the last one, because drawing the screen costs battery) |
-| Sensors | Battery, Charging, Last interaction, Activity running |
+| Camera | Screenshot: taken only when you press "Take screenshot". It shows whatever is on screen once screen capture is allowed (otherwise only this app). HA's own refreshes re-send the last one, at most every 5 s. |
+| Sensors | Battery, Charging, Activity running |
 | Settings | Home Assistant URL, Harmonium page path, Remote profile, Start page, Activity entity, Idle activity states, Weather entity, Keep screen on, Dim after, Dimmed brightness, Keep-on limit, No keep-on limit on the cradle, Proximity wake, Screensaver when dimmed, Charging screen, Battery readout (on/off, position, size), Long press, Android screen timeout |
-| Diagnostics | Android version, App version, App uptime, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Network uptime, RAM available/total, Wi-Fi signal |
+| Diagnostics | Android version, App version, App uptime, App memory, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Network uptime, RAM available/total, Wi-Fi signal |
+
+**Entity dropdowns.** Activity entity and Weather entity are dropdowns of the matching entities
+in your HA (activity selects, weather entities). The ESPHome connection can't list HA's entities,
+so on each connection the remote asks HA to fill them in through an action (its own
+`esphome.<device>_entity_lists`). Turn on **Allow the device to perform Home Assistant actions**
+once: Settings → Devices & services → ESPHome → this remote → Configure. Until then HA shows a
+repair about it, and the dropdowns offer only the current value. The remote's Settings screen
+uses the same lists.
 
 The settings are the same values as the remote's Settings screen; a change from either side
 applies right away (page settings reload Harmonium). Left out on purpose: the token (it would
@@ -93,7 +107,10 @@ Some controls need a one-time permission, granted from the remote's Settings →
 - **Screen off**: device admin ("force lock"). Without it, turning the screen off shows a black
   screensaver at minimum brightness instead.
 - **Modify system settings**: brightness, adaptive brightness and Android's screen timeout.
-- **Usage access**: the Foreground app diagnostic. Without it, it only says whether it's this app.
+- **Usage access**: the Foreground app diagnostic (the package in front, e.g.
+  `com.google.android.youtube`). Without it, it only says whether it's this app.
+- **Screenshots**: Android's screen-capture dialog. Tick "Don't show again", or it asks each time
+  the app starts.
 
 CPU usage is the whole device when Android allows reading it; Android 8 usually doesn't, and it
 then reports this app's share. Diagnostics refresh every minute; controls report back right away.

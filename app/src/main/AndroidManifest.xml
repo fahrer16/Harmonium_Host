@@ -34,15 +34,14 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Uncomment once it's stable so it replaces Fully Kiosk as the remote's home screen
-                 (it then also comes back by itself after a reboot). -->
-            <!--
+            <!-- Can be the remote's home screen (the app asks once; Settings → Permissions → Home
+                 screen). Then Home comes back here and it starts by itself after a reboot. The stock
+                 launcher (com.aiks.HaRemote) stays installed as the fallback. -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.HOME" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-            -->
         </activity>
 
         <!-- Also in the app drawer as "Harmonium settings", so it's reachable without adb. -->
@@ -56,6 +55,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Invisible: shows Android's screen-capture dialog (screenshots of any app). Its own task,
+             so the app that was in front comes back when it closes. -->
+        <activity
+            android:name=".CaptureConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="com.example.harmoniumhost.capture"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- Lets Home Assistant turn the screen off. Enabled by the user in Settings → Permissions. -->
         <receiver

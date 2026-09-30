@@ -47,6 +47,13 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private const val ESPHOME_VERSION = "2025.9.0"
         private const val REFRESH_S = 60L
         private const val CAMERA_CHUNK = 8 * 1024
+        /**
+         * HA's live camera view asks for the next image the moment one arrives. Answering at full
+         * speed kept two threads copying images non-stop (GC storms, a sluggish remote, battery).
+         */
+        private const val IMAGE_GAP_MS = 5_000L
+        /** Give HA time to register this device's services before asking it to call one. */
+        private const val HA_ACTION_DELAY_MS = 3_000L
 
         // message ids (api.proto `option (id)`)
         private const val HELLO_REQ = 1; private const val HELLO_RESP = 2
@@ -66,9 +73,13 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private const val SWITCH_STATE = 26
         private const val TEXT_SENSOR_STATE = 27
         private const val SWITCH_COMMAND = 33
+        private const val SUBSCRIBE_HA_SERVICES = 34
+        private const val HA_ACTION = 35
         private const val SUBSCRIBE_HA_STATES = 38
         private const val SUBSCRIBE_HA_STATE = 39
         private const val HA_STATE = 40
+        private const val LIST_SERVICE = 41
+        private const val EXECUTE_SERVICE = 42
         private const val LIST_CAMERA = 43
         private const val CAMERA_IMAGE = 44
         private const val CAMERA_REQUEST = 45
@@ -105,6 +116,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
 
     /** Set once by HostService before [start]. */
     @Volatile var entities: List<EspEntity> = emptyList()
+    @Volatile var services: List<EspService> = emptyList()
+    /** HA accepted action requests on a connection (they still need "Allow the device to perform Home Assistant actions"). */
+    @Volatile var onActionsReady: () -> Unit = {}
     /** (entity_id, attribute) pairs HA should forward; attribute "" = the state. */
     @Volatile var haSubscriptions: () -> List<Pair<String, String>> = { emptyList() }
     @Volatile var onHaState: (entityId: String, attribute: String, state: String) -> Unit = { _, _, _ -> }
@@ -112,6 +126,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
 
     private val io = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "esphome-io").apply { isDaemon = true } }
     private val refreshQueued = AtomicBoolean(false)
+    private val periodic = AtomicBoolean(false)
     private val connections = CopyOnWriteArrayList<Conn>()
     @Volatile private var voiceConn: Conn? = null
     @Volatile private var server: ServerSocket? = null
@@ -132,7 +147,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 while (!ss.isClosed) {
                     val s = ss.accept()
                     s.tcpNoDelay = true
-                    s.soTimeout = 150_000          // HA pings every 20 s; silence this long = gone
+                    s.soTimeout = 90_000           // HA pings every 20 s; silence this long = gone
                     val c = Conn(s)
                     connections += c
                     thread(name = "esphome-conn", isDaemon = true) { c.run() }
@@ -143,7 +158,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             }
         }
         // Diagnostics drift slowly; a sleeping CPU simply delays this, it never wakes it.
-        io.scheduleWithFixedDelay({ refresh() }, REFRESH_S, REFRESH_S, TimeUnit.SECONDS)
+        if (periodic.compareAndSet(false, true)) {
+            io.scheduleWithFixedDelay({ refresh() }, REFRESH_S, REFRESH_S, TimeUnit.SECONDS)
+        }
         advertise()
     }
 
@@ -188,13 +205,33 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
     }
 
     /**
-     * HA asks for an image whenever someone looks at the camera (a dashboard refreshes it every
-     * 10 s). Drawing the screen costs battery on this chip, so that only re-sends the last one.
+     * HA asks for an image whenever someone looks at the camera: a card every 10 s, the live view
+     * nonstop. Drawing the screen costs battery on this chip, so that only re-sends the last one,
+     * at most every [IMAGE_GAP_MS] per connection (extra requests in between are merged).
      */
     private fun sendLastImage(to: Conn) {
-        val cam = entities.filterIsInstance<EspCamera>().firstOrNull() ?: return
-        lastImage?.let { sendImage(to, cam, it) }
-            ?: Log.i(TAG, "no screenshot yet: press Take screenshot in Home Assistant")
+        if (!to.imageQueued.compareAndSet(false, true)) return
+        val wait = (to.lastImageAt + IMAGE_GAP_MS - nowMs()).coerceAtLeast(0)
+        io.schedule({
+            to.imageQueued.set(false)
+            to.lastImageAt = nowMs()
+            val cam = entities.filterIsInstance<EspCamera>().firstOrNull() ?: return@schedule
+            lastImage?.let { sendImage(to, cam, it) }
+                ?: Log.i(TAG, "no screenshot yet: press Take screenshot in Home Assistant")
+        }, wait, TimeUnit.MILLISECONDS)
+    }
+
+    private fun nowMs() = System.nanoTime() / 1_000_000
+
+    /**
+     * Asks HA to perform an action, with templates HA renders first. Needs the device option
+     * "Allow the device to perform Home Assistant actions" in HA (HA raises a repair if it's off).
+     */
+    fun callHaAction(action: String, dataTemplate: Map<String, String>) {
+        val msg = ProtoWriter().string(1, action).apply {
+            dataTemplate.forEach { (k, v) -> message(3, ProtoWriter().string(1, k).string(2, v)) }
+        }.toByteArray()
+        connections.filter { it.actionsWanted }.forEach { it.send(HA_ACTION, msg) }
     }
 
     private fun sendImage(to: Conn, cam: EspCamera, jpeg: ByteArray) {
@@ -240,7 +277,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             is EspSwitch -> LIST_SWITCH to w.string(5, e.icon).uint(8, e.category.toLong()).toByteArray()
             is EspNumber -> LIST_NUMBER to w.string(5, e.icon).float(6, e.min).float(7, e.max).float(8, e.step)
                 .uint(10, e.category.toLong()).string(11, e.unit).uint(12, e.mode.toLong()).toByteArray()
-            is EspSelect -> LIST_SELECT to w.string(5, e.icon).apply { e.options.forEach { string(6, it) } }
+            is EspSelect -> LIST_SELECT to w.string(5, e.icon).apply { e.options().forEach { string(6, it) } }
                 .uint(8, e.category.toLong()).toByteArray()
             is EspText -> LIST_TEXT to w.string(5, e.icon).uint(7, e.category.toLong())
                 .uint(9, e.maxLength.toLong()).toByteArray()           // min_length 0, mode TEXT
@@ -328,6 +365,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private val peer = socket.inetAddress?.hostAddress ?: "?"
         @Volatile private var closed = false
         @Volatile var statesWanted = false
+        @Volatile var actionsWanted = false
+        val imageQueued = AtomicBoolean(false)
+        @Volatile var lastImageAt = -IMAGE_GAP_MS
         /** HA accepts entity-state subscriptions on this connection; the ones already asked for. */
         @Volatile private var haStatesWanted = false
         private val haSubscribed = HashSet<Pair<String, String>>()
@@ -442,7 +482,26 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 DEVICE_INFO_REQ -> send(DEVICE_INFO_RESP, deviceInfo())
                 LIST_ENTITIES_REQ -> {
                     entities.forEach { e -> listMessage(e).let { send(it.first, it.second) } }
+                    services.forEach { s ->
+                        send(LIST_SERVICE, ProtoWriter().string(1, s.name).fixed32(2, s.key).apply {
+                            s.args.forEach { a -> message(3, ProtoWriter().string(1, a).uint(2, 3)) }   // STRING
+                        }.toByteArray())
+                    }
                     send(LIST_DONE, ByteArray(0))
+                }
+                SUBSCRIBE_HA_SERVICES -> {
+                    actionsWanted = true
+                    io.schedule({ if (!closed) onActionsReady() }, HA_ACTION_DELAY_MS, TimeUnit.MILLISECONDS)
+                }
+                EXECUTE_SERVICE -> {
+                    val r = ProtoReader(payload)
+                    val key = r.fixed32(1)
+                    val s = services.firstOrNull { it.key == key }
+                    if (s != null) {
+                        val values = r.messages(2).map { it.string(4) }
+                        Log.i(TAG, "ESPHome: HA called ${s.name}")
+                        try { s.run(s.args.zip(values).toMap()) } catch (e: Exception) { Log.w(TAG, "${s.name} failed: $e") }
+                    }
                 }
                 SUBSCRIBE_STATES -> {
                     statesWanted = true

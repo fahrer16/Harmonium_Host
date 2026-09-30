@@ -142,8 +142,25 @@ class HostPrefs(context: Context) {
     val screensaverMode get() = str("screensaver_mode", "clock").takeIf { it in SCREENSAVER_MODES } ?: "clock"
     /** Show the screensaver when the screen dims (instead of just dimming Harmonium). */
     val screensaverWhenDimmed get() = bool("screensaver_when_dimmed", true)
-    /** HA weather entity for the weather screensaver, e.g. weather.home. */
-    val weatherEntity get() = str("weather_entity")
+    /** HA weather entity for the weather screensaver, e.g. weather.home. "none" (from HA's dropdown) = not set. */
+    val weatherEntity get() = str("weather_entity").takeIf { it != "none" } ?: ""
+
+    // ---- Entity lists for dropdowns (HA fills them in, see RemoteDevice.requestEntityLists) ----
+    var haWeatherEntities: List<String>
+        get() = list("ha_weather_entities")
+        set(v) = edit { putString("ha_weather_entities", v.joinToString(",")) }
+    var haActivityEntities: List<String>
+        get() = list("ha_activity_entities")
+        set(v) = edit { putString("ha_activity_entities", v.joinToString(",")) }
+    private fun list(key: String) = (sp.getString(key, null) ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+    // ---- Screenshots and one-time questions ----
+    /** Android's screen-capture dialog was accepted once: ask again (silently, if ticked) at start. */
+    var captureGranted: Boolean
+        get() = bool("capture_granted", false)
+        set(v) = edit { putBoolean("capture_granted", v) }
+    fun asked(what: String) = bool("asked_$what", false)
+    fun markAsked(what: String) = edit { putBoolean("asked_$what", true) }
 
     // ---- Charging and status line ----
     val chargeScreenSec get() = int("charge_screen_s", 4)
