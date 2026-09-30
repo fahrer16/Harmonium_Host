@@ -39,8 +39,8 @@ import com.example.harmoniumhost.HarmoniumStyle as S
 
 /**
  * Every setting the remote needs, saved on the remote (SharedPreferences via [HostPrefs]).
- * Open it with a swipe down from the top edge or by touching and holding near it for a second,
- * from Home Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
+ * Open it from the pull-down panel (pull down from the top edge, or hold a finger there; then
+ * Settings), from Home Assistant (the "Open settings on the remote" button), from the launcher ("Harmonium settings"), or with `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`.
  * Styled like Harmonium (see [HarmoniumStyle]); every control is D-pad reachable and shows the
  * amber focus ring. Plain views built in code: nothing to inflate, and fields are one line each.
  */
@@ -138,6 +138,8 @@ class SettingsActivity : AppCompatActivity() {
         number("awake_limit_min", "Stop keeping it on after (minutes without a press, 0 = no limit)",
             prefs.awakeLimitMin)
         toggle("cradle_no_limit", "No limit while on the cradle", prefs.cradleNoLimit)
+        toggle("lift_wake", "Wake when picked up (off the cradle; keeps the processor awake while the screen is off)",
+            prefs.liftWake)
         toggle("proximity_wake", "Wake when a hand comes near (proximity sensor)", prefs.proximityWake)
         timeoutField = field("Android screen timeout (seconds; applies when not kept on)", "",
             systemTimeoutSec()?.toString() ?: "", InputType.TYPE_CLASS_NUMBER)
@@ -365,7 +367,7 @@ class SettingsActivity : AppCompatActivity() {
                 setTextColor(S.TEXT)
             })
             addView(TextView(this@SettingsActivity).apply {
-                text = "Version ${app.versionName} · swipe down from the top, or hold a finger there, to come back here"
+                text = "Version ${app.versionName} · pull down from the top edge, then Settings, to come back here"
                 textSize = 12f
                 setTextColor(S.DIM)
             })

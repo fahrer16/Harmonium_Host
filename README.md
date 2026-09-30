@@ -24,17 +24,21 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.example.harmoniumhost/.MainActivity
 ```
 
-Check you're running this build: the settings title shows the version (0.5), and
-`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.5 starting`.
+Check you're running this build: the settings title shows the version (0.6), and
+`adb logcat -s HarmoniumHost` prints `Harmonium Host 0.6 starting`.
 
 ## Settings
 
-Open settings in any of these ways:
-- **Swipe down from the top edge**, or **touch and hold near the top edge** for a second (within
-  about a finger's width of it). The Astrion firmware can take the swipe for its own settings
-  panel; the hold works either way.
-- Press **Home**, once Harmonium Host is the home screen (it asks once; also Settings →
-  Permissions → Home screen), then use the above.
+**Pull down from the top edge** (like Android's notification shade) for the quick panel: Wi-Fi
+and Home Assistant status, battery, brightness and volume sliders, and buttons for Reload, Stay on
+(keep the screen on everywhere), Clock (screensaver) and **Settings** (everything below). Touching
+and holding near the top edge for a second opens it too. Swipe it back up, tap below it, or press
+Back to close it; it closes by itself after 30 s.
+
+If the stock Astrion app is running it can take the pull for its own panel; make Harmonium Host
+the home screen (it asks once; also Settings → Permissions → Home screen) and restart the remote.
+
+Other ways into Settings:
 - Press **Open settings on the remote** on the device in Home Assistant.
 - Open **Harmonium settings** from the Android app drawer.
 - `adb shell am start -n com.example.harmoniumhost/.SettingsActivity`

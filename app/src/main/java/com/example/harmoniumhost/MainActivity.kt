@@ -47,12 +47,13 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val TAG = "HarmoniumHost"
         /**
-         * Two ways to open Settings, both only watched (Harmonium still gets the touch): a swipe
-         * down from the top edge, and touching and holding near it. The Astrion firmware can take
-         * the swipe for its own panel (less so once this app is the home screen); the hold still works.
+         * The pull-down panel ([QuickPanel]): a drag that starts this close to the top edge and
+         * heads down pulls it (the page gets a cancel once it's clearly a pull), and touching and
+         * holding near the edge opens it too. The stock Astrion app, if it runs, can take the pull
+         * for its own panel; the hold still works then.
          */
-        private const val SWIPE_EDGE_DP = 36
-        private const val SWIPE_DISTANCE_DP = 90
+        private const val PULL_EDGE_DP = 36
+        private const val PULL_START_DP = 12
         private const val HOLD_ZONE_DP = 64
         private const val HOLD_MS = 1_000L
         /** Moving further than this means scrolling, not holding. */
@@ -92,10 +93,12 @@ class MainActivity : AppCompatActivity() {
     private val remap = KeyRemap { window.superDispatchKeyEvent(it) }
     private val hideVoiceOverlay = Runnable { voiceOverlay.visibility = View.GONE }
     private var swallowGesture = false
-    private val holdToOpenSettings = Runnable { openSettings() }
-    private var holdX = 0f
-    private var holdY = 0f
-    private var swipeFromTop = false
+    private lateinit var panel: QuickPanel
+    private val holdOpensPanel = Runnable { panel.open() }
+    private var touchX = 0f
+    private var touchY = 0f
+    private var pullFromTop = false
+    private var pulling = false
     private var setupPromptOpen = false
     /** The screen-on that HA's screensaver switch causes must not hide the screensaver again. */
     private var keepScreensaverUntil = 0L
@@ -104,7 +107,8 @@ class MainActivity : AppCompatActivity() {
         override fun onHostState() {
             updateStatusLine()
             keeper.evaluate()
-            if (screensaver.showing) screensaver.updateWeather()
+            if (screensaver.showing) screensaver.update()
+            if (panel.isOpen) panel.refresh()
         }
         override fun onHostEvent(event: HostState.Event) {
             when (event) {
@@ -185,12 +189,22 @@ class MainActivity : AppCompatActivity() {
         }
         charging = ChargingScreen(this)
         screensaver = Screensaver(this)
+        panel = QuickPanel(this, object : QuickPanel.Actions {
+            override fun reload() = loadHarmonium()
+            override fun screensaver() = screensaver.show(prefs.screensaverMode)
+            override fun openSettings() = this@MainActivity.openSettings()
+            override fun settingsChanged() {
+                applySettings()
+                app.esp.refresh()
+            }
+        })
         root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(webView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(statusLine, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             addView(screensaver, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(voiceOverlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(panel, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(charging, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         }
         setContentView(root)
@@ -349,6 +363,14 @@ class MainActivity : AppCompatActivity() {
             Log.i(TAG, "key ${KeyEvent.keyCodeToString(event.keyCode)} code=${event.keyCode} " +
                 "scan=${event.scanCode} ${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}")
         }
+        if (panel.isOpen && !isMicKey(event)) {         // the D-pad moves around the panel; Back closes it
+            panel.poke()
+            if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                if (event.action == KeyEvent.ACTION_UP) panel.close()
+                return true
+            }
+            return super.dispatchKeyEvent(event)
+        }
         if (event.action == KeyEvent.ACTION_DOWN) {
             interaction()                               // the key still goes on to Harmonium below
             charging.dismiss()
@@ -384,41 +406,65 @@ class MainActivity : AppCompatActivity() {
             }
             return true
         }
-        watchSettingsGesture(ev)
+        if (pulling && watchPull(ev)) return true           // mid-pull: the panel follows the finger
+        if (panel.isOpen) {
+            panel.poke()
+            return super.dispatchTouchEvent(ev)
+        }
+        if (watchPull(ev)) return true
         return super.dispatchTouchEvent(ev)
     }
 
     /**
-     * Opens Settings on a swipe down from the top edge, or on one finger held still near it for
-     * [HOLD_MS]. Watches only.
+     * The pull from the top edge that brings [panel] down, and the hold near the edge that opens
+     * it. Until a drag is clearly a pull the page gets every event (Harmonium keeps its own
+     * gestures); from then on the panel follows the finger. Returns true once the pull owns the gesture.
      */
-    private fun watchSettingsGesture(ev: MotionEvent) {
+    private fun watchPull(ev: MotionEvent): Boolean {
         val dp = resources.displayMetrics.density
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                root.removeCallbacks(holdToOpenSettings)
-                holdX = ev.x
-                holdY = ev.y
-                swipeFromTop = ev.y < SWIPE_EDGE_DP * dp
-                if (ev.y < HOLD_ZONE_DP * dp) root.postDelayed(holdToOpenSettings, HOLD_MS)
+                root.removeCallbacks(holdOpensPanel)
+                touchX = ev.x
+                touchY = ev.y
+                pulling = false
+                pullFromTop = ev.y < PULL_EDGE_DP * dp
+                if (ev.y < HOLD_ZONE_DP * dp) root.postDelayed(holdOpensPanel, HOLD_MS)
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = abs(ev.x - holdX)
-                val dy = ev.y - holdY
-                if (dx > HOLD_SLOP_DP * dp || abs(dy) > HOLD_SLOP_DP * dp) root.removeCallbacks(holdToOpenSettings)
-                if (swipeFromTop) {
-                    if (dx > dy && dx > 24 * dp) swipeFromTop = false        // sideways: not ours
-                    else if (dy > SWIPE_DISTANCE_DP * dp) {
-                        swipeFromTop = false
-                        openSettings()
-                    }
+                val dx = abs(ev.x - touchX)
+                val dy = ev.y - touchY
+                if (dx > HOLD_SLOP_DP * dp || abs(dy) > HOLD_SLOP_DP * dp) root.removeCallbacks(holdOpensPanel)
+                if (pulling) {
+                    panel.dragTo(dy)
+                    return true
+                }
+                if (pullFromTop && dy > PULL_START_DP * dp && dy > dx) {
+                    pulling = true
+                    Log.i(TAG, "pulling the panel down")
+                    val cancel = MotionEvent.obtain(ev).apply { action = MotionEvent.ACTION_CANCEL }
+                    super.dispatchTouchEvent(cancel)                  // the page lets go of this touch
+                    cancel.recycle()
+                    panel.beginDrag()
+                    panel.dragTo(dy)
+                    return true
+                }
+                if (dx > 24 * dp) pullFromTop = false                // sideways: Harmonium's, not ours
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                root.removeCallbacks(holdOpensPanel)
+                if (pulling) {
+                    pulling = false
+                    panel.release()
+                    return true
                 }
             }
-            else -> {                                             // lifted, cancelled, or a second finger
-                root.removeCallbacks(holdToOpenSettings)
-                swipeFromTop = false
+            else -> {                                                 // a second finger
+                root.removeCallbacks(holdOpensPanel)
+                pullFromTop = false
             }
         }
+        return false
     }
 
     // ---------- Harmonium ----------
