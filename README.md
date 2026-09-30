@@ -76,7 +76,7 @@ sentence. Releasing the button always ends it.
 |---|---|
 | Controls | Screen (switch), Screensaver (switch), Screensaver mode (black / clock / weather), Adaptive brightness (switch), Screen brightness (%), Volume (%) |
 | Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot, Open settings on the remote |
-| Camera | Screenshot (a fresh one each time HA asks, or after "Take screenshot") |
+| Camera | Screenshot: taken only when you press "Take screenshot" (HA's own refreshes re-send the last one, because drawing the screen costs battery) |
 | Sensors | Battery, Charging, Last interaction, Activity running |
 | Settings | Home Assistant URL, Harmonium page path, Remote profile, Start page, Activity entity, Idle activity states, Weather entity, Keep screen on, Dim after, Dimmed brightness, Keep-on limit, No keep-on limit on the cradle, Proximity wake, Screensaver when dimmed, Charging screen, Battery readout (on/off, position, size), Long press, Android screen timeout |
 | Diagnostics | Android version, App version, App uptime, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Network uptime, RAM available/total, Wi-Fi signal |
@@ -103,13 +103,18 @@ settings; HA forwards its condition and temperature over the ESPHome connection.
 
 ## Battery
 
-Keeping the screen on costs battery: the backlight at minimum plus a CPU that can't suspend. The
-defaults keep the cost down:
-- The screen is kept on only while an activity is running, and dims after 15 s.
-- It is released after 20 minutes without a press. Then Android's own screen timeout applies,
-  which you can also set in settings.
-- On the cradle there is no limit, because battery isn't an issue there.
+Keeping the screen on costs battery: the backlight at minimum plus a CPU that can't suspend. So
+by default the screen is kept on **only on the cradle**:
+- Off the cradle, Android's own screen timeout turns it off (set it in settings), and the
+  remote's firmware turns it back on when you pick the remote up.
+- On the cradle it stays on, dims after 15 s and shows the screensaver (clock by default).
+- "While an activity is running" (0.3's default) keeps it on, dimmed, off the cradle too, for up
+  to 20 minutes after the last press. It makes the very first press reliable if lift-wake
+  misses, at a real battery cost. 0.4 moves remotes still on that old default to the cradle
+  setting once.
+- The Settings screen no longer holds the screen on while it's open.
 - The high-performance Wi-Fi lock is held only while the screen is on.
+- Screenshots are taken only when you press the button.
 - Home Assistant pings the ESPHome connection about every 20 s. Each ping wakes the remote
   briefly. That's the same as any ESPHome voice satellite.
 

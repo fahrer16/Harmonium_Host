@@ -18,8 +18,12 @@ class HostPrefs(context: Context) {
 
     companion object {
         const val KEEP_NEVER = "never"
+        /** Only on the cradle: off it, the screen times out and the firmware's lift-wake turns it on. */
+        const val KEEP_CRADLE = "cradle"
         const val KEEP_ACTIVITY = "activity"
         const val KEEP_ALWAYS = "always"
+        val KEEP_MODES = listOf(KEEP_CRADLE, KEEP_ACTIVITY, KEEP_ALWAYS, KEEP_NEVER)
+        private const val PREFS_VERSION = 2
         val SCREENSAVER_MODES = listOf("black", "clock", "weather")
 
         /**
@@ -49,6 +53,24 @@ class HostPrefs(context: Context) {
     }
 
     private val sp = context.getSharedPreferences("host", Context.MODE_PRIVATE)
+
+    init { migrate() }
+
+    /**
+     * 0.4 changed two defaults that earlier Saves had written out as explicit values: keep-awake
+     * "activity" held the screen on (dimmed) for up to 20 minutes after every use, and the
+     * screensaver never showed by itself. Move those old defaults to the new ones, once.
+     */
+    private fun migrate() {
+        if (sp.getInt("prefs_version", 1) >= PREFS_VERSION) return
+        sp.edit().apply {
+            if (sp.getString("keep_awake", null) == KEEP_ACTIVITY) putString("keep_awake", KEEP_CRADLE)
+            if (sp.contains("screensaver_when_dimmed") && !sp.getBoolean("screensaver_when_dimmed", true)) {
+                remove("screensaver_when_dimmed")
+            }
+            putInt("prefs_version", PREFS_VERSION)
+        }.apply()
+    }
 
     private fun str(key: String, default: String = "") =
         sp.getString(key, null)?.takeIf { it.isNotBlank() }?.trim() ?: default
@@ -107,7 +129,7 @@ class HostPrefs(context: Context) {
     val micScanCode get() = int("mic_scancode", -1)
 
     // ---- Screen and wake ----
-    val keepAwake get() = str("keep_awake", KEEP_ACTIVITY)
+    val keepAwake get() = str("keep_awake", KEEP_CRADLE).takeIf { it in KEEP_MODES } ?: KEEP_CRADLE
     val dimAfterSec get() = int("dim_after_s", 15)
     val dimLevelPct get() = int("dim_level_pct", 1)
     /** Keep-awake gives up after this long without a press (0 = never). */
@@ -119,7 +141,7 @@ class HostPrefs(context: Context) {
     // ---- Screensaver ----
     val screensaverMode get() = str("screensaver_mode", "clock").takeIf { it in SCREENSAVER_MODES } ?: "clock"
     /** Show the screensaver when the screen dims (instead of just dimming Harmonium). */
-    val screensaverWhenDimmed get() = bool("screensaver_when_dimmed", false)
+    val screensaverWhenDimmed get() = bool("screensaver_when_dimmed", true)
     /** HA weather entity for the weather screensaver, e.g. weather.home. */
     val weatherEntity get() = str("weather_entity")
 

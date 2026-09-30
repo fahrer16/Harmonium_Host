@@ -21,7 +21,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -75,7 +74,6 @@ class SettingsActivity : AppCompatActivity() {
         prefs = app.prefs
         micCode = prefs.micKeyCode
         micScan = prefs.micScanCode
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)   // don't sleep mid-typing
         window.statusBarColor = S.BG
         window.navigationBarColor = S.BG
         page = LinearLayout(this).apply {
@@ -132,7 +130,8 @@ class SettingsActivity : AppCompatActivity() {
 
         section("Screen and wake")
         choice("keep_awake", "Keep the screen on (dimmed) so the first press always works",
-            listOf(HostPrefs.KEEP_ACTIVITY to "While an activity is running",
+            listOf(HostPrefs.KEEP_CRADLE to "Only on the cradle (saves battery)",
+                HostPrefs.KEEP_ACTIVITY to "While an activity is running",
                 HostPrefs.KEEP_ALWAYS to "Always",
                 HostPrefs.KEEP_NEVER to "Never (Android's timeout)"),
             prefs.keepAwake)

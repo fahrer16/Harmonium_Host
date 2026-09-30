@@ -155,7 +155,7 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
         settingText(86, "weather_entity", "weather_entity", "Weather entity", "mdi:weather-partly-cloudy") {
             prefs.weatherEntity },
         settingSelect(87, "keep_awake", "keep_awake", "Keep screen on", "mdi:cellphone-lock",
-            listOf(HostPrefs.KEEP_ACTIVITY, HostPrefs.KEEP_ALWAYS, HostPrefs.KEEP_NEVER)) { prefs.keepAwake },
+            HostPrefs.KEEP_MODES) { prefs.keepAwake },
         settingNumber(88, "dim_after", "dim_after_s", "Dim after", "mdi:brightness-4",
             0, 3600, unit = "s") { prefs.dimAfterSec },
         settingNumber(89, "dim_level", "dim_level_pct", "Dimmed brightness", "mdi:brightness-5",

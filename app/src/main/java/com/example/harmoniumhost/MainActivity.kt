@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
@@ -94,6 +95,8 @@ class MainActivity : AppCompatActivity() {
     private var holdX = 0f
     private var holdY = 0f
     private var lastInteractionReport = 0L
+    /** The screen-on that HA's screensaver switch causes must not hide the screensaver again. */
+    private var keepScreensaverUntil = 0L
 
     private val hostListener = object : HostState.Listener {
         override fun onHostState() {
@@ -104,7 +107,7 @@ class MainActivity : AppCompatActivity() {
         override fun onHostEvent(event: HostState.Event) {
             when (event) {
                 HostState.Event.SCREEN_ON -> {
-                    interaction()
+                    if (SystemClock.elapsedRealtime() < keepScreensaverUntil) keeper.interaction() else interaction()
                     goImmersive()
                 }
                 // A hand coming near brightens a dimmed screen before the thumb lands.
@@ -124,7 +127,13 @@ class MainActivity : AppCompatActivity() {
                     webView.clearCache(true)
                     loadHarmonium()
                 }
-                HostState.Event.SCREENSAVER_ON -> screensaver.show(prefs.screensaverMode)
+                HostState.Event.SCREENSAVER_ON -> {
+                    if (!(getSystemService(POWER_SERVICE) as PowerManager).isInteractive) {
+                        keepScreensaverUntil = SystemClock.elapsedRealtime() + 5_000
+                        app.device?.wake()                   // shown on a dark screen, nobody would see it
+                    }
+                    screensaver.show(prefs.screensaverMode)
+                }
                 HostState.Event.SCREENSAVER_OFF -> screensaver.hide()
                 HostState.Event.SCREEN_BLACK -> {
                     screensaver.show("black")

@@ -116,6 +116,8 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
     @Volatile private var voiceConn: Conn? = null
     @Volatile private var server: ServerSocket? = null
     private var nsd: NsdManager.RegistrationListener? = null
+    /** The last screenshot. HA's own image requests get this; only [pushImage] takes a new one. */
+    @Volatile private var lastImage: ByteArray? = null
 
     /** HA has subscribed to this remote's voice assistant: push-to-talk can run. */
     val voiceReady get() = voiceConn != null
@@ -175,19 +177,34 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         }
     }
 
-    /** Captures and sends a fresh image for [cam] to every connection. */
+    /** Captures a fresh image for [cam] (the "Take screenshot" button) and sends it to every connection. */
     fun pushImage(cam: EspCamera) {
         thread(name = "esphome-camera") {
             val jpeg = try { cam.capture() } catch (e: Exception) { Log.w(TAG, "screenshot: $e"); null } ?: return@thread
-            var off = 0
-            while (off < jpeg.size) {
-                val n = minOf(CAMERA_CHUNK, jpeg.size - off)
-                val last = off + n >= jpeg.size
-                val msg = ProtoWriter().fixed32(1, cam.key).bytes(2, jpeg.copyOfRange(off, off + n))
-                    .bool(3, last).toByteArray()
-                connections.forEach { it.send(CAMERA_IMAGE, msg) }
-                off += n
-            }
+            Log.i(TAG, "screenshot taken (${jpeg.size / 1024} KB)")
+            lastImage = jpeg
+            connections.forEach { sendImage(it, cam, jpeg) }
+        }
+    }
+
+    /**
+     * HA asks for an image whenever someone looks at the camera (a dashboard refreshes it every
+     * 10 s). Drawing the screen costs battery on this chip, so that only re-sends the last one.
+     */
+    private fun sendLastImage(to: Conn) {
+        val cam = entities.filterIsInstance<EspCamera>().firstOrNull() ?: return
+        lastImage?.let { sendImage(to, cam, it) }
+            ?: Log.i(TAG, "no screenshot yet: press Take screenshot in Home Assistant")
+    }
+
+    private fun sendImage(to: Conn, cam: EspCamera, jpeg: ByteArray) {
+        var off = 0
+        while (off < jpeg.size) {
+            val n = minOf(CAMERA_CHUNK, jpeg.size - off)
+            val last = off + n >= jpeg.size
+            to.send(CAMERA_IMAGE, ProtoWriter().fixed32(1, cam.key).bytes(2, jpeg.copyOfRange(off, off + n))
+                .bool(3, last).toByteArray())
+            off += n
         }
     }
 
@@ -442,7 +459,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                     onHaState(r.string(1), r.string(3), r.string(2))
                 }
                 SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND, TEXT_COMMAND -> command(type, payload)
-                CAMERA_REQUEST -> entities.filterIsInstance<EspCamera>().firstOrNull()?.let { pushImage(it) }
+                CAMERA_REQUEST -> sendLastImage(this)
                 SUBSCRIBE_VOICE -> {
                     val r = ProtoReader(payload)
                     if (r.bool(1)) {
