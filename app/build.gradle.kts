@@ -9,13 +9,28 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.harmoniumhost"
+        // The code's package stays com.example.harmoniumhost; this is the installed app's identity.
+        applicationId = "io.github.fahrer16.harmoniumhost"
         minSdk = 27
         targetSdk = 37
-        versionCode = 7
-        versionName = "0.6"
+        versionCode = 100
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Release signing comes from the environment (the GitHub release workflow decodes the keystore
+    // from repository secrets). Without it, the release build is left unsigned.
+    val releaseKeystore = System.getenv("RELEASE_KEYSTORE_FILE")
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
@@ -23,6 +38,7 @@ android {
             optimization {
                 enable = false
             }
+            if (releaseKeystore != null) signingConfig = signingConfigs.getByName("release")
         }
     }
     compileOptions {
