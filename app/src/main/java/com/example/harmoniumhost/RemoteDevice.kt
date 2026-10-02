@@ -55,6 +55,9 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
     @Volatile var networkUpSince = SystemClock.elapsedRealtime()
     private var cpuLast: Pair<Long, Long>? = null   // (busy, total) jiffies, or app cpu ms / wall ms
 
+    /** New versions from GitHub, offered as HA's update entity. */
+    val updater = AppUpdater(context) { esp.refresh() }
+
     /** The whole screen (any app) when Android's capture was allowed, else this app's own window. */
     val screenshotCamera = EspCamera(30, "screenshot", "Screenshot", "mdi:cellphone-screenshot",
         capture = { ScreenCapture.capture(context) ?: HostState.screenshot?.invoke() })
@@ -171,6 +174,10 @@ class RemoteDevice(private val context: Context, private val esp: EspServer) {
             "mdi:power-plug") { prefs.cradleNoLimit },
         settingSwitch(92, "proximity_wake", "proximity_wake", "Proximity wake", "mdi:hand-wave") { prefs.proximityWake },
         settingSwitch(100, "lift_wake", "lift_wake", "Wake when picked up", "mdi:hand-back-right") { prefs.liftWake },
+        EspSwitch(101, "wireless_adb", "Wireless ADB", "mdi:android-debug-bridge", EspEntity.CAT_CONFIG,
+            read = { WirelessAdb.on }, write = { on -> WirelessAdb.set(on) }),
+        EspUpdate(110, "app_update", "Harmonium Host", "mdi:update", EspEntity.CAT_CONFIG,
+            read = { updater.info() }, command = { updater.command(it) }),
         settingSwitch(93, "screensaver_when_dimmed", "screensaver_when_dimmed", "Screensaver when dimmed",
             "mdi:image-filter-hdr") { prefs.screensaverWhenDimmed },
         settingNumber(94, "charging_screen", "charge_screen_s", "Charging screen", "mdi:battery-charging",

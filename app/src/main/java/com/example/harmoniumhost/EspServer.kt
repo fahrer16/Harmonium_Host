@@ -101,6 +101,9 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
         private const val VOICE_AUDIO = 106
         private const val VOICE_CONFIG_REQ = 121
         private const val VOICE_CONFIG_RESP = 122
+        private const val LIST_UPDATE = 116
+        private const val UPDATE_STATE = 117
+        private const val UPDATE_COMMAND = 118
 
         // VoiceAssistantFeature: VOICE_ASSISTANT | API_AUDIO (mic audio over this TCP connection).
         // No SPEAKER flag: HA then sends the reply as a URL, which the remote plays itself.
@@ -282,6 +285,8 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             is EspText -> LIST_TEXT to w.string(5, e.icon).uint(7, e.category.toLong())
                 .uint(9, e.maxLength.toLong()).toByteArray()           // min_length 0, mode TEXT
             is EspButton -> LIST_BUTTON to w.string(5, e.icon).uint(7, e.category.toLong()).toByteArray()
+            is EspUpdate -> LIST_UPDATE to w.string(5, e.icon).uint(7, e.category.toLong())
+                .string(8, "firmware").toByteArray()
             is EspCamera -> LIST_CAMERA to w.string(6, e.icon).uint(7, e.category.toLong()).toByteArray()
         }
     }
@@ -297,6 +302,12 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
             is EspNumber -> e.read().let { v -> NUMBER_STATE to w.float(2, v ?: 0f).bool(3, v == null).toByteArray() }
             is EspSelect -> e.read().let { v -> SELECT_STATE to w.string(2, v ?: "").bool(3, v == null).toByteArray() }
             is EspText -> e.read().let { v -> TEXT_STATE to w.string(2, (v ?: "").take(e.maxLength)).bool(3, v == null).toByteArray() }
+            is EspUpdate -> e.read().let { u ->
+                UPDATE_STATE to (if (u == null) w.bool(2, true) else w.bool(3, u.inProgress)
+                    .bool(4, u.progress != null).float(5, u.progress ?: 0f)
+                    .string(6, u.current).string(7, u.latest).string(8, u.title)
+                    .string(9, u.summary.take(255)).string(10, u.url)).toByteArray()
+            }
             is EspButton, is EspCamera -> null
         }
     }
@@ -313,6 +324,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                 type == NUMBER_COMMAND && e is EspNumber -> e.write(r.float(2))
                 type == SELECT_COMMAND && e is EspSelect -> e.write(r.string(2))
                 type == TEXT_COMMAND && e is EspText -> e.write(r.string(2))
+                type == UPDATE_COMMAND && e is EspUpdate -> e.command(r.uint(2).toInt())
                 type == BUTTON_COMMAND && e is EspButton -> e.press()
             }
         } catch (ex: Exception) {
@@ -517,7 +529,7 @@ class EspServer(private val context: Context, private val prefs: HostPrefs) {
                     val r = ProtoReader(payload)
                     onHaState(r.string(1), r.string(3), r.string(2))
                 }
-                SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND, TEXT_COMMAND -> command(type, payload)
+                SWITCH_COMMAND, NUMBER_COMMAND, SELECT_COMMAND, BUTTON_COMMAND, TEXT_COMMAND, UPDATE_COMMAND -> command(type, payload)
                 CAMERA_REQUEST -> sendLastImage(this)
                 SUBSCRIBE_VOICE -> {
                     val r = ProtoReader(payload)

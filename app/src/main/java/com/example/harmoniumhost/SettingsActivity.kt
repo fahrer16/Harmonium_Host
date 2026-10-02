@@ -61,6 +61,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var micLabel: TextView
     private lateinit var statusText: TextView
     private lateinit var permissionsText: TextView
+    private lateinit var adbStatus: TextView
     private var micCode = 0
     private var micScan = -1
     private var learningMic = false
@@ -193,6 +194,19 @@ class SettingsActivity : AppCompatActivity() {
         }, Triple("Usage access", false) {
             SystemAccess.openUsageAccess(this)
         })
+        buttons(Triple("Install updates", false) {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+        })
+
+        section("Wireless ADB")
+        note("Lets a computer on your network use adb without the USB cable, e.g. " +
+            "`adb connect <this remote's IP>:5555`. While it's on, anyone on your network can install " +
+            "apps on the remote or run commands on it, so turn it off when you're done. It's off again " +
+            "after the remote restarts, unless the option below is on. Needs USB debugging (Android " +
+            "settings → Developer options). Home Assistant has the same switch (Wireless ADB).")
+        adbStatus = body("")
+        buttons(Triple("Turn on", false) { setWirelessAdb(true) }, Triple("Turn off", false) { setWirelessAdb(false) })
+        toggle("adb_at_start", "Turn it on whenever the app starts", prefs.adbAtStart)
 
         section("More")
         buttons(Triple("Reload Harmonium", false) {
@@ -215,6 +229,29 @@ class SettingsActivity : AppCompatActivity() {
         super.onResume()
         statusText.text = statusSummary()
         permissionsText.text = permissionSummary()
+        showWirelessAdb()
+    }
+
+    private fun setWirelessAdb(on: Boolean) {
+        adbStatus.text = if (on) "Turning on…" else "Turning off…"
+        thread(name = "adb-wifi") {
+            val ok = WirelessAdb.set(on)
+            runOnUiThread {
+                if (!ok) toast("This remote's firmware didn't allow it")
+                showWirelessAdb()
+            }
+        }
+    }
+
+    private fun showWirelessAdb() = thread(name = "adb-wifi-status") {
+        val on = WirelessAdb.on
+        val usb = WirelessAdb.usbDebugging(this)
+        val text = when {
+            !usb -> "USB debugging is off: turn it on in Android settings → Developer options first."
+            on -> "On: adb connect ${ipAddress() ?: "<this remote's IP>"}:${WirelessAdb.PORT}"
+            else -> "Off (USB only)."
+        }
+        runOnUiThread { adbStatus.text = text }
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -341,6 +378,7 @@ class SettingsActivity : AppCompatActivity() {
             "${mark(admin)} Screen off: lets HA turn the screen off (device admin). Without it, \"off\" is a black screensaver.",
             "${mark(Settings.System.canWrite(this))} Modify system settings: brightness, adaptive brightness, screen timeout.",
             "${mark(usage)} Usage access: the foreground-app diagnostic.",
+            "${mark(packageManager.canRequestPackageInstalls())} Install updates: lets Home Assistant's Install button update this app (Android still asks to confirm on the remote).",
         ).joinToString("\n")
     }
 

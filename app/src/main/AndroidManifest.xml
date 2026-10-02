@@ -12,6 +12,8 @@
     <!-- Optional: lets Settings change Android's screen timeout. Granted by the user in Settings. -->
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
     <!-- Optional: the "foreground app" diagnostic. Granted by the user under Usage access. -->
+    <!-- Updates from GitHub releases (Home Assistant's update entity); Android still asks to confirm. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
 
@@ -75,6 +77,15 @@
                 android:resource="@xml/device_admin" />
             <intent-filter>
                 <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- The installer's answers during an update, and restarting the app after one. -->
+        <receiver
+            android:name=".UpdateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

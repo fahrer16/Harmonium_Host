@@ -142,6 +142,8 @@ class HostPrefs(context: Context) {
      * the sensor only reports while the processor is awake, so it costs battery off the cradle.
      */
     val liftWake get() = bool("lift_wake", true)
+    /** Turn wireless ADB on whenever the app starts (it's off after every reboot otherwise). */
+    val adbAtStart get() = bool("adb_at_start", false)
 
     // ---- Screensaver ----
     val screensaverMode get() = str("screensaver_mode", "clock").takeIf { it in SCREENSAVER_MODES } ?: "clock"
