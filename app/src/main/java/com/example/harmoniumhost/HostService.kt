@@ -24,6 +24,7 @@ import androidx.core.content.ContextCompat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
 import kotlin.math.abs
 
 /**
@@ -151,6 +152,8 @@ class HostService : Service() {
         app.esp.haSubscriptions = { device.haSubscriptions() }
         app.esp.onHaState = { id, attr, state -> device.onHaState(id, attr, state) }
         app.esp.start()
+        device.updater.start()
+        if (app.prefs.adbAtStart) thread(name = "adb-wifi") { WirelessAdb.set(true) }
 
         val sticky = ContextCompat.registerReceiver(this, events, IntentFilter().apply {
             addAction(Intent.ACTION_POWER_CONNECTED)

@@ -63,6 +63,18 @@ class EspButton(
     val press: () -> Unit,
 ) : EspEntity(key, objectId, name, icon, category)
 
+/** What HA's update entity shows. [progress] is 0–100, or null when there's no progress to show. */
+data class UpdateInfo(
+    val current: String, val latest: String, val title: String, val summary: String, val url: String,
+    val inProgress: Boolean, val progress: Float?,
+)
+
+/** HA's update entity ("firmware"): [command] gets 1 = install, 2 = check now. */
+class EspUpdate(
+    key: Int, objectId: String, name: String, icon: String = "", category: Int = CAT_NONE,
+    val read: () -> UpdateInfo?, val command: (Int) -> Unit,
+) : EspEntity(key, objectId, name, icon, category)
+
 /**
  * An action HA can call on the remote; HA names it `esphome.<device name>_<name>`. String
  * arguments only. Not an entity, but listed alongside them.

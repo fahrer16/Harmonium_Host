@@ -81,7 +81,14 @@ Harmonium Host replaces both apps with one:
 
 Restart the remote once so it comes up in Harmonium Host.
 
-**Updating:** install the newer APK over the old one (`adb install -r …`). Settings are kept.
+**Updating:** Home Assistant shows new releases on the remote's device page (and under
+Settings → Updates). Press **Install**: the remote downloads the release, checks it, and Android
+asks on the remote to confirm, so tap **Install** there. The first time, Android also asks to allow
+"Install unknown apps" for Harmonium Host (it opens that screen on the remote). Settings are kept.
+Or install the newer APK over the old one with `adb install -r …`.
+
+This works for installs from the GitHub releases. A build you made yourself is signed with your own
+key, so a release can't update it.
 
 ## Settings
 
@@ -143,9 +150,10 @@ sentence. Releasing the button always ends it.
 |---|---|
 | Controls | Screen (switch), Screensaver (switch), Screensaver mode (black / clock / weather), Adaptive brightness (switch), Screen brightness (%), Volume (%) |
 | Buttons | Bring to front, Reload page, Clear cache, Restart app, Take screenshot, Open settings on the remote |
+| Update | Harmonium Host: the installed and latest release, its notes, and Install (checked every 6 hours) |
 | Camera | Screenshot: taken only when you press "Take screenshot". It shows whatever is on screen once screen capture is allowed (otherwise only this app). HA's own refreshes re-send the last one, at most every 5 s. |
 | Sensors | Battery, Charging, Activity running |
-| Settings | Home Assistant URL, Harmonium page path, Remote profile, Start page, Activity entity, Idle activity states, Weather entity, Keep screen on, Dim after, Dimmed brightness, Keep-on limit, No keep-on limit on the cradle, Proximity wake, Screensaver when dimmed, Charging screen, Battery readout (on/off, position, size), Long press, Android screen timeout |
+| Settings | Wireless ADB (on/off), Home Assistant URL, Harmonium page path, Remote profile, Start page, Activity entity, Idle activity states, Weather entity, Keep screen on, Dim after, Dimmed brightness, Keep-on limit, No keep-on limit on the cradle, Proximity wake, Screensaver when dimmed, Charging screen, Battery readout (on/off, position, size), Long press, Android screen timeout |
 | Diagnostics | Android version, App version, App uptime, App memory, Connected, CPU usage, Current page, Device name, Foreground app, Internal storage free/total, IPv4 address, Network uptime, RAM available/total, Wi-Fi signal |
 
 **Entity dropdowns.** Activity entity and Weather entity are dropdowns of the matching entities
@@ -213,6 +221,20 @@ adb logcat -s HarmoniumHost
 This logs the version at start, every key (keycode and scancode), screen on/off, proximity
 near/far events, the activity state, keep-awake on/off, and ESPHome connections and voice
 events. Harmonium itself can be inspected in `chrome://inspect`.
+
+## Wireless ADB
+
+To update or debug without the USB cable, turn wireless ADB on from the pull-down panel →
+Settings → **Wireless ADB** (or the Wireless ADB switch in Home Assistant), then on the computer:
+
+```bash
+adb connect <remote-ip>:5555
+```
+
+It needs USB debugging (Android settings → Developer options) and is off again after the remote
+restarts, unless "Turn it on whenever the app starts" is on. While it's on, anyone on your network
+can install apps on the remote or run commands on it, so turn it off when you're done. (It works
+like the Blue-key toggle in Harmonium's Key Mapper setup.)
 
 ## Building from source
 
